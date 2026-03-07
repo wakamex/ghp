@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gh-pulse"
+version = "0.1.0"
+description = "Stateless GitHub activity summary — compact, LLM-friendly output"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+
+[project.scripts]
+gh-pulse = "gh_pulse.cli:main"
