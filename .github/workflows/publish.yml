@@ -50,8 +50,9 @@ jobs:
           expected="${GITHUB_REF_NAME#v}"
           mkdir -p "$HOME"
           got=""
-          for _ in $(seq 1 15); do
+          for i in $(seq 1 15); do
             got="$(uvx ghp --version 2>/dev/null || true)"
+            echo "attempt=$i got=${got:-<no output>}"
             if [ "$got" = "ghp $expected" ]; then
               exit 0
             fi
