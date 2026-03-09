@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 ISO_8601_UTC = "%Y-%m-%dT%H:%M:%SZ"
 GITHUB_HANDLE_CHARS = "A-Za-z0-9-"
+LAST_UPDATE_FILENAME = ".gh-pulse-last-update-timestamp"
 
 
 class ApiError(RuntimeError):
@@ -328,6 +329,38 @@ def _fetch_comments(repo, token, limit, cutoff):
     return _merge_comments([issue_comments, review_comments], limit)
 
 
+def _fetch_commits(repo, token, limit, cutoff):
+    if not cutoff:
+        return []
+
+    per_page = min(max(limit, 30), 100)
+    commits = []
+    page = 1
+
+    while len(commits) < limit:
+        batch = _api(
+            f"repos/{repo}/commits",
+            token,
+            {
+                "since": cutoff,
+                "per_page": per_page,
+                "page": page,
+            },
+        )
+        if not isinstance(batch, list):
+            raise ApiError("Unexpected commits payload from GitHub API")
+        if not batch:
+            break
+
+        commits.extend(batch[: max(limit - len(commits), 0)])
+
+        if len(batch) < per_page:
+            break
+        page += 1
+
+    return commits[:limit]
+
+
 def _mention_pattern(handle):
     normalized = handle.lstrip("@").strip()
     if not normalized:
@@ -353,6 +386,40 @@ def _emit_error(message, json_output, repo, timestamp, cutoff):
         )
         return
     print(f"Error: {message}", file=sys.stderr)
+
+
+def _timestamp_file_path():
+    return os.path.join(os.getcwd(), LAST_UPDATE_FILENAME)
+
+
+def _load_last_update_timestamp():
+    path = _timestamp_file_path()
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        raw = fh.read().strip()
+    if not raw:
+        return None
+    return _resolve_since(raw)
+
+
+def _save_last_update_timestamp(timestamp):
+    path = _timestamp_file_path()
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(timestamp + "\n")
+
+
+def _fmt_commit(commit):
+    sha = (commit.get("sha") or "")[:7] or "?"
+    message = (commit.get("commit") or {}).get("message") or ""
+    summary = message.splitlines()[0].strip() if message else "[no message]"
+    author = (
+        ((commit.get("author") or {}).get("login"))
+        or ((commit.get("commit") or {}).get("author") or {}).get("name")
+        or "unknown"
+    )
+    date = ((commit.get("commit") or {}).get("author") or {}).get("date") or ""
+    return f'  {sha} @{author} {date}: "{summary}"'
 
 
 def main():
@@ -398,7 +465,7 @@ def main():
         return 1
 
     try:
-        cutoff = _resolve_since(args.since) if args.since else None
+        cutoff = _resolve_since(args.since) if args.since else _load_last_update_timestamp()
     except ValueError as exc:
         _emit_error(str(exc), args.json, repo, now, cutoff)
         return 1
@@ -409,6 +476,7 @@ def main():
         issues = _fetch_issues(repo, token, args.limit, cutoff)
         prs = _fetch_prs(repo, token, args.limit, cutoff)
         comments = _fetch_comments(repo, token, args.limit, cutoff)
+        commits = _fetch_commits(repo, token, args.limit, cutoff)
     except ApiError as exc:
         _emit_error(str(exc), args.json, repo, now, cutoff)
         return 1
@@ -458,8 +526,22 @@ def main():
                 }
                 for comment in comments
             ],
+            "commits": [
+                {
+                    "sha": commit.get("sha"),
+                    "message": ((commit.get("commit") or {}).get("message") or "").splitlines()[0],
+                    "author": (
+                        ((commit.get("author") or {}).get("login"))
+                        or ((commit.get("commit") or {}).get("author") or {}).get("name")
+                    ),
+                    "date": ((commit.get("commit") or {}).get("author") or {}).get("date"),
+                    "url": commit.get("html_url"),
+                }
+                for commit in commits
+            ],
         }
         print(json_mod.dumps(out, indent=2))
+        _save_last_update_timestamp(now)
         return 0
 
     print(f"# {repo} | {now}")
@@ -487,6 +569,12 @@ def main():
             print(_fmt_comment(comment))
         print()
 
+    if cutoff and commits:
+        print(f"COMMITS ({len(commits)})")
+        for commit in commits:
+            print(_fmt_commit(commit))
+        print()
+
     mention_re = _mention_pattern(args.me) if args.me else None
     if mention_re and comments:
         hits = [
@@ -504,6 +592,8 @@ def main():
             print(f"No activity since {cutoff}.")
         else:
             print("No open issues or PRs.")
+
+    _save_last_update_timestamp(now)
 
     return 0
 
