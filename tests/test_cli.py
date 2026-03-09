@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import tempfile
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -84,6 +86,44 @@ class FetchTests(unittest.TestCase):
         self.assertEqual("review", comments[0]["comment_type"])
         self.assertEqual("8", cli._comment_number(comments[0]))
 
+    def test_fetch_commits_returns_empty_without_cutoff(self):
+        self.assertEqual([], cli._fetch_commits("owner/repo", "token", 5, None))
+
+    def test_fetch_commits_requests_commits_since_cutoff(self):
+        commits = [
+            {
+                "sha": "abcdef123456",
+                "commit": {
+                    "message": "Fix bug\n\nMore detail",
+                    "author": {"name": "Mihai", "date": "2026-03-07T17:00:00Z"},
+                },
+                "author": {"login": "mihai"},
+                "html_url": "https://github.com/owner/repo/commit/abcdef123456",
+            }
+        ]
+
+        with mock.patch("gh_pulse.cli._api", return_value=commits) as api_mock:
+            result = cli._fetch_commits(
+                "owner/repo", "token", 3, "2026-03-07T15:00:00Z"
+            )
+
+        self.assertEqual(["abcdef123456"], [commit["sha"] for commit in result])
+        api_mock.assert_called_once()
+
+
+class TimestampFileTests(unittest.TestCase):
+    def test_load_last_update_timestamp_returns_none_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch("os.getcwd", return_value=tmpdir):
+            self.assertIsNone(cli._load_last_update_timestamp())
+
+    def test_save_and_load_last_update_timestamp_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch("os.getcwd", return_value=tmpdir):
+            cli._save_last_update_timestamp("2026-03-09T12:00:00Z")
+            self.assertEqual(
+                "2026-03-09T12:00:00Z",
+                cli._load_last_update_timestamp(),
+            )
+
 
 class MainTests(unittest.TestCase):
     def test_main_emits_json_error_and_nonzero_exit_on_api_failure(self):
@@ -100,6 +140,87 @@ class MainTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual("owner/repo", payload["repo"])
         self.assertEqual("boom", payload["error"])
+
+    def test_main_uses_last_update_file_when_since_is_omitted(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            timestamp_path = os.path.join(tmpdir, cli.LAST_UPDATE_FILENAME)
+            with open(timestamp_path, "w", encoding="utf-8") as fh:
+                fh.write("2026-03-07T15:00:00Z\n")
+
+            with mock.patch.object(
+                sys, "argv", ["gh-pulse", "--repo", "owner/repo"]
+            ), mock.patch("os.getcwd", return_value=tmpdir), mock.patch(
+                "gh_pulse.cli._fetch_issues", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_prs", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_comments", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_commits", return_value=[]
+            ), redirect_stdout(stdout):
+                code = cli.main()
+
+        self.assertEqual(0, code)
+        self.assertIn("# since 2026-03-07T15:00:00Z", stdout.getvalue())
+
+    def test_main_autosaves_last_update_timestamp_on_success(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.object(
+                sys, "argv", ["gh-pulse", "--repo", "owner/repo"]
+            ), mock.patch("os.getcwd", return_value=tmpdir), mock.patch(
+                "gh_pulse.cli._fetch_issues", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_prs", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_comments", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_commits", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._utc_now",
+                return_value=cli._parse_iso8601("2026-03-09T12:34:56Z"),
+            ), redirect_stdout(stdout):
+                code = cli.main()
+
+            self.assertEqual(0, code)
+            with open(
+                os.path.join(tmpdir, cli.LAST_UPDATE_FILENAME), "r", encoding="utf-8"
+            ) as fh:
+                self.assertEqual("2026-03-09T12:34:56Z", fh.read().strip())
+
+    def test_main_includes_commits_in_json_output(self):
+        stdout = io.StringIO()
+        commits = [
+            {
+                "sha": "abcdef123456",
+                "commit": {
+                    "message": "Fix bug\n\nMore detail",
+                    "author": {"name": "Mihai", "date": "2026-03-07T17:00:00Z"},
+                },
+                "author": {"login": "mihai"},
+                "html_url": "https://github.com/owner/repo/commit/abcdef123456",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.object(
+                sys, "argv", ["gh-pulse", "--json", "--repo", "owner/repo", "--since", "1h"]
+            ), mock.patch("os.getcwd", return_value=tmpdir), mock.patch(
+                "gh_pulse.cli._fetch_issues", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_prs", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_comments", return_value=[]
+            ), mock.patch(
+                "gh_pulse.cli._fetch_commits", return_value=commits
+            ), redirect_stdout(stdout):
+                code = cli.main()
+
+        self.assertEqual(0, code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("abcdef123456", payload["commits"][0]["sha"])
+        self.assertEqual("Fix bug", payload["commits"][0]["message"])
 
 
 if __name__ == "__main__":
