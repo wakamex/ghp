@@ -295,13 +295,13 @@ class MainTests(unittest.TestCase):
             "\n".join(
                 [
                     "owner/repo 2026-03-07T18:00:00Z since=2026-03-07T17:00:00Z",
-                    "iss 1",
+                    "issues 1",
                     "#7 open @alice trim output l:bug,p1 c:2",
                     "pr 1",
                     "#9 open,draft @bob feat->main ship less text c:1 rc:3",
-                    "com 1",
+                    "comments 1",
                     "#9 review @carol 2026-03-07T17:00:00Z: ping @clod with the latest diff",
-                    "git 1",
+                    "commits 1",
                     "abcdef1 @dave 2026-03-07T17:30:00Z tighten output",
                     "@clod 1",
                     "#9 review @carol 2026-03-07T17:00:00Z: ping @clod with the latest diff",

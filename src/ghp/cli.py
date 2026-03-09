@@ -581,11 +581,11 @@ def main():
         head = f"{head} since={cutoff}"
     print(head)
 
-    _print_section("iss", issues, _fmt_issue)
+    _print_section("issues", issues, _fmt_issue)
     _print_section("pr", prs, _fmt_pr)
     if cutoff:
-        _print_section("com", comments, _fmt_comment)
-        _print_section("git", commits, _fmt_commit)
+        _print_section("comments", comments, _fmt_comment)
+        _print_section("commits", commits, _fmt_commit)
 
     mention_re = _mention_pattern(args.me) if args.me else None
     if mention_re and comments:
