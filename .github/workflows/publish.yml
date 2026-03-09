@@ -44,8 +44,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: verify pypi install
         env:
-          UV_TOOL_DIR: ${{ runner.temp }}/uv-tools
+          HOME: ${{ runner.temp }}/home
           UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
         run: |
+          mkdir -p "$HOME"
           uv tool install --force ghp
-          "$UV_TOOL_DIR/bin/ghp" --help
+          "$HOME/.local/bin/ghp" --help

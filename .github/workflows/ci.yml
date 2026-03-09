@@ -24,15 +24,17 @@ jobs:
           python -m build
       - name: uv tool smoke
         env:
-          UV_TOOL_DIR: ${{ runner.temp }}/uv-tools
+          HOME: ${{ runner.temp }}/home-dist
           UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
         run: |
+          mkdir -p "$HOME"
           uv tool install --force --no-index --find-links dist ghp
-          "$UV_TOOL_DIR/bin/ghp" --help
+          "$HOME/.local/bin/ghp" --help
       - name: uv tool local smoke
         env:
-          UV_TOOL_DIR: ${{ runner.temp }}/uv-tools-local
+          HOME: ${{ runner.temp }}/home-local
           UV_CACHE_DIR: ${{ runner.temp }}/uv-cache-local
         run: |
+          mkdir -p "$HOME"
           uv tool install --force -e .
-          "$UV_TOOL_DIR/bin/ghp" --help
+          "$HOME/.local/bin/ghp" --help
