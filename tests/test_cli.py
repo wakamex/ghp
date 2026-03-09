@@ -162,7 +162,7 @@ class MainTests(unittest.TestCase):
                 code = cli.main()
 
         self.assertEqual(0, code)
-        self.assertIn("# since 2026-03-07T15:00:00Z", stdout.getvalue())
+        self.assertIn("since=2026-03-07T15:00:00Z", stdout.getvalue())
 
     def test_main_autosaves_last_update_timestamp_on_success(self):
         stdout = io.StringIO()
@@ -221,6 +221,107 @@ class MainTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual("abcdef123456", payload["commits"][0]["sha"])
         self.assertEqual("Fix bug", payload["commits"][0]["message"])
+
+    def test_main_emits_compact_text_output(self):
+        stdout = io.StringIO()
+        issue = {
+            "number": 7,
+            "state": "open",
+            "title": "trim output",
+            "user": {"login": "alice"},
+            "labels": [{"name": "bug"}, {"name": "p1"}],
+            "comments": 2,
+        }
+        pr = {
+            "number": 9,
+            "state": "open",
+            "title": "ship less text",
+            "user": {"login": "bob"},
+            "head": {"ref": "feat"},
+            "base": {"ref": "main"},
+            "comments": 1,
+            "review_comments": 3,
+            "draft": True,
+        }
+        comment = {
+            "id": 20,
+            "comment_type": "review",
+            "pull_request_url": "https://api.github.com/repos/owner/repo/pulls/9",
+            "user": {"login": "carol"},
+            "body": "ping @clod with the latest diff",
+            "created_at": "2026-03-07T17:00:00Z",
+            "updated_at": "2026-03-07T17:00:00Z",
+        }
+        commits = [
+            {
+                "sha": "abcdef123456",
+                "commit": {
+                    "message": "tighten output\n\nmore detail",
+                    "author": {"name": "Dave", "date": "2026-03-07T17:30:00Z"},
+                },
+                "author": {"login": "dave"},
+            }
+        ]
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["gh-pulse", "--repo", "owner/repo", "--since", "1h", "--me", "@clod"],
+        ), mock.patch("gh_pulse.cli._utc_now", return_value=cli._parse_iso8601("2026-03-07T18:00:00Z")), mock.patch(
+            "gh_pulse.cli._fetch_issues", return_value=[issue]
+        ), mock.patch("gh_pulse.cli._fetch_prs", return_value=[pr]), mock.patch(
+            "gh_pulse.cli._fetch_comments", return_value=[comment]
+        ), mock.patch(
+            "gh_pulse.cli._fetch_commits", return_value=commits
+        ), redirect_stdout(stdout):
+            code = cli.main()
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            "\n".join(
+                [
+                    "owner/repo 2026-03-07T18:00:00Z since=2026-03-07T17:00:00Z",
+                    "iss 1",
+                    "#7 open @alice trim output l:bug,p1 c:2",
+                    "pr 1",
+                    "#9 open,draft @bob feat->main ship less text c:1 rc:3",
+                    "com 1",
+                    "#9 review @carol 2026-03-07T17:00:00Z: ping @clod with the latest diff",
+                    "git 1",
+                    "abcdef1 @dave 2026-03-07T17:30:00Z tighten output",
+                    "@clod 1",
+                    "#9 review @carol 2026-03-07T17:00:00Z: ping @clod with the latest diff",
+                    "",
+                ]
+            ),
+            stdout.getvalue(),
+        )
+
+    def test_main_accepts_positional_since_shorthand(self):
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            sys, "argv", ["ghp", "1h", "--repo", "owner/repo"]
+        ), mock.patch(
+            "gh_pulse.cli._utc_now",
+            return_value=cli._parse_iso8601("2026-03-07T18:00:00Z"),
+        ), mock.patch(
+            "gh_pulse.cli._fetch_issues", return_value=[]
+        ), mock.patch(
+            "gh_pulse.cli._fetch_prs", return_value=[]
+        ), mock.patch(
+            "gh_pulse.cli._fetch_comments", return_value=[]
+        ), mock.patch(
+            "gh_pulse.cli._fetch_commits", return_value=[]
+        ), redirect_stdout(stdout):
+            code = cli.main()
+
+        self.assertEqual(0, code)
+        self.assertTrue(
+            stdout.getvalue().startswith(
+                "owner/repo 2026-03-07T18:00:00Z since=2026-03-07T17:00:00Z"
+            )
+        )
 
 
 if __name__ == "__main__":

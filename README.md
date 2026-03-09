@@ -20,6 +20,8 @@ gh-pulse --json                       # machine-readable output
 gh-pulse --me @clod                   # highlight mentions
 gh-pulse --repo owner/name            # explicit repo
 # default delta cursor comes from .gh-pulse-last-update-timestamp if present
+ghp --since 1h                        # short alias
+ghp 1h                                # positional --since shorthand
 ```
 
 ## Behavior

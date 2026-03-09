@@ -12,3 +12,4 @@ license = "MIT"
 
 [project.scripts]
 gh-pulse = "gh_pulse.cli:main"
+ghp = "gh_pulse.cli:main"

@@ -137,15 +137,18 @@ def _resolve_since(raw):
 
 
 def _fmt_issue(issue):
+    parts = [
+        f'#{issue["number"]}',
+        issue["state"],
+        f'@{issue["user"]["login"]}',
+        issue["title"],
+    ]
     labels = ",".join(label["name"] for label in issue.get("labels", []))
-    label_str = f" [{labels}]" if labels else ""
-    comment_str = (
-        f" ({issue['comments']} comments)" if issue.get("comments") else ""
-    )
-    return (
-        f'  #{issue["number"]} [{issue["state"]}] "{issue["title"]}" '
-        f'@{issue["user"]["login"]}{label_str}{comment_str}'
-    )
+    if labels:
+        parts.append(f"l:{labels}")
+    if issue.get("comments"):
+        parts.append(f'c:{issue["comments"]}')
+    return " ".join(parts)
 
 
 def _fmt_pr(pr):
@@ -153,17 +156,18 @@ def _fmt_pr(pr):
     if pr.get("draft"):
         status = f"{status},draft"
 
-    extras = []
+    parts = [
+        f'#{pr["number"]}',
+        status,
+        f'@{pr["user"]["login"]}',
+        f'{pr["head"]["ref"]}->{pr["base"]["ref"]}',
+        pr["title"],
+    ]
     if isinstance(pr.get("comments"), int) and pr["comments"] > 0:
-        extras.append(f"{pr['comments']} comments")
+        parts.append(f'c:{pr["comments"]}')
     if isinstance(pr.get("review_comments"), int) and pr["review_comments"] > 0:
-        extras.append(f"{pr['review_comments']} review comments")
-    extra_str = f" ({', '.join(extras)})" if extras else ""
-
-    return (
-        f'  #{pr["number"]} [{status}] "{pr["title"]}" @{pr["user"]["login"]} '
-        f'{pr["head"]["ref"]} -> {pr["base"]["ref"]}{extra_str}'
-    )
+        parts.append(f'rc:{pr["review_comments"]}')
+    return " ".join(parts)
 
 
 def _comment_number(comment):
@@ -187,9 +191,17 @@ def _trim_comment_body(body, limit):
 def _fmt_comment(comment):
     kind = "review" if comment.get("comment_type") == "review" else "comment"
     return (
-        f"  #{_comment_number(comment)} {kind} @{comment['user']['login']} "
+        f"#{_comment_number(comment)} {kind} @{comment['user']['login']} "
         f"{_comment_timestamp(comment)}: {_trim_comment_body(comment.get('body'), 120)}"
     )
+
+
+def _print_section(name, items, formatter):
+    if not items:
+        return
+    print(f"{name} {len(items)}")
+    for item in items:
+        print(formatter(item))
 
 
 def _fetch_issues(repo, token, limit, cutoff):
@@ -381,7 +393,7 @@ def _emit_error(message, json_output, repo, timestamp, cutoff):
                     "since": cutoff,
                     "error": message,
                 },
-                indent=2,
+                separators=(",", ":"),
             )
         )
         return
@@ -419,13 +431,19 @@ def _fmt_commit(commit):
         or "unknown"
     )
     date = ((commit.get("commit") or {}).get("author") or {}).get("date") or ""
-    return f'  {sha} @{author} {date}: "{summary}"'
+    return f"{sha} @{author} {date} {summary}"
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="gh-pulse",
         description="Stateless GitHub activity summary — compact, LLM-friendly output",
+    )
+    parser.add_argument(
+        "since_pos",
+        nargs="?",
+        metavar="TIME",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--since",
@@ -445,6 +463,8 @@ def main():
         "--limit", type=int, default=30, help="Max items per category (default: 30)"
     )
     args = parser.parse_args()
+    if args.since and args.since_pos:
+        parser.error("use TIME or --since, not both")
 
     now = _format_utc(_utc_now())
     repo = args.repo or _detect_repo()
@@ -465,7 +485,8 @@ def main():
         return 1
 
     try:
-        cutoff = _resolve_since(args.since) if args.since else _load_last_update_timestamp()
+        raw_since = args.since or args.since_pos
+        cutoff = _resolve_since(raw_since) if raw_since else _load_last_update_timestamp()
     except ValueError as exc:
         _emit_error(str(exc), args.json, repo, now, cutoff)
         return 1
@@ -540,40 +561,20 @@ def main():
                 for commit in commits
             ],
         }
-        print(json_mod.dumps(out, indent=2))
+        print(json_mod.dumps(out, separators=(",", ":")))
         _save_last_update_timestamp(now)
         return 0
 
-    print(f"# {repo} | {now}")
+    head = f"{repo} {now}"
     if cutoff:
-        print(f"# since {cutoff}")
-    else:
-        print("# open items snapshot")
-    print()
+        head = f"{head} since={cutoff}"
+    print(head)
 
-    if issues:
-        print(f"ISSUES ({len(issues)})")
-        for issue in issues:
-            print(_fmt_issue(issue))
-        print()
-
-    if prs:
-        print(f"PRS ({len(prs)})")
-        for pr in prs:
-            print(_fmt_pr(pr))
-        print()
-
-    if cutoff and comments:
-        print(f"COMMENTS ({len(comments)} updated)")
-        for comment in comments:
-            print(_fmt_comment(comment))
-        print()
-
-    if cutoff and commits:
-        print(f"COMMITS ({len(commits)})")
-        for commit in commits:
-            print(_fmt_commit(commit))
-        print()
+    _print_section("iss", issues, _fmt_issue)
+    _print_section("pr", prs, _fmt_pr)
+    if cutoff:
+        _print_section("com", comments, _fmt_comment)
+        _print_section("git", commits, _fmt_commit)
 
     mention_re = _mention_pattern(args.me) if args.me else None
     if mention_re and comments:
@@ -582,16 +583,12 @@ def main():
         ]
         if hits:
             handle = args.me.lstrip("@")
-            print(f"MENTIONS (@{handle}: {len(hits)})")
+            print(f"@{handle} {len(hits)}")
             for comment in hits:
                 print(_fmt_comment(comment))
-            print()
 
-    if not issues and not prs and not comments:
-        if cutoff:
-            print(f"No activity since {cutoff}.")
-        else:
-            print("No open issues or PRs.")
+    if not issues and not prs and not comments and not commits:
+        print("none")
 
     _save_last_update_timestamp(now)
 
