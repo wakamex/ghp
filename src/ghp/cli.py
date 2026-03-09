@@ -21,6 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from importlib.metadata import PackageNotFoundError, version
 
 ISO_8601_UTC = "%Y-%m-%dT%H:%M:%SZ"
 GITHUB_HANDLE_CHARS = "A-Za-z0-9-"
@@ -33,6 +34,13 @@ class ApiError(RuntimeError):
 
 def _utc_now():
     return datetime.now(timezone.utc)
+
+
+def _pkg_version():
+    try:
+        return version("ghp")
+    except PackageNotFoundError:
+        return "0.0.0"
 
 
 def _format_utc(dt):
@@ -451,6 +459,9 @@ def main():
         help="Show deltas since TIME (ISO 8601 or relative: 30m, 2h, 1d, 1w)",
     )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {_pkg_version()}"
+    )
     parser.add_argument(
         "--me", metavar="HANDLE", help="Highlight mentions of this handle (e.g. @clod)"
     )

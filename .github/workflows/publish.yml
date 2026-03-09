@@ -36,3 +36,16 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  verify:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: astral-sh/setup-uv@v5
+      - name: verify pypi install
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/uv-tools
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
+        run: |
+          uv tool install --force ghp
+          "$UV_TOOL_DIR/bin/ghp" --help

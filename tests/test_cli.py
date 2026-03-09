@@ -126,6 +126,20 @@ class TimestampFileTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def test_main_emits_version(self):
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            sys, "argv", ["ghp", "--version"]
+        ), mock.patch(
+            "ghp.cli._pkg_version", return_value="0.1.0"
+        ), redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as exc:
+                cli.main()
+
+        self.assertEqual(0, exc.exception.code)
+        self.assertEqual("ghp 0.1.0\n", stdout.getvalue())
+
     def test_main_emits_json_error_and_nonzero_exit_on_api_failure(self):
         stdout = io.StringIO()
 

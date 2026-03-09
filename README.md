@@ -44,4 +44,5 @@ Looks for tokens in this order:
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests
+scripts/test-install.sh
 ```

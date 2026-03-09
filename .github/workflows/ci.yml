@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - name: unit
+        run: PYTHONPATH=src python -m unittest discover -s tests
+      - name: build
+        run: |
+          uv venv
+          . .venv/bin/activate
+          uv pip install build
+          python -m build
+      - name: uv tool smoke
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/uv-tools
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
+        run: |
+          uv tool install --force --no-index --find-links dist ghp
+          "$UV_TOOL_DIR/bin/ghp" --help
+      - name: uv tool local smoke
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/uv-tools-local
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache-local
+        run: |
+          uv tool install --force -e .
+          "$UV_TOOL_DIR/bin/ghp" --help
