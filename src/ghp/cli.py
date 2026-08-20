@@ -4,7 +4,9 @@ Compact, LLM-friendly output. Caller owns the cursor via --since.
 
 Usage:
     ghp                               # snapshot: open issues + PRs
+    ghp upstream                      # summarize the upstream remote
     ghp 1h                            # deltas since 1 hour ago
+    ghp upstream 1h                   # upstream deltas since 1 hour ago
     ghp 2026-03-07T14:00:00Z
     ghp --json                        # machine-readable output
     ghp --me @clod                    # highlight mentions
@@ -17,9 +19,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version
 
@@ -75,11 +79,11 @@ def _get_token():
     return None
 
 
-def _detect_repo():
-    """Detect owner/repo from git remote."""
+def _detect_repo(remote="origin"):
+    """Detect owner/repo from a git remote."""
     try:
         result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
+            ["git", "remote", "get-url", remote],
             capture_output=True,
             text=True,
             timeout=5,
@@ -340,13 +344,27 @@ def _fetch_comments(repo, token, limit, cutoff):
     if not cutoff:
         return []
 
-    issue_comments = _fetch_comment_endpoint(
-        repo, token, "issues/comments", "issue", limit, cutoff
-    )
-    review_comments = _fetch_comment_endpoint(
-        repo, token, "pulls/comments", "review", limit, cutoff
-    )
-    return _merge_comments([issue_comments, review_comments], limit)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        issue_comments = executor.submit(
+            _fetch_comment_endpoint,
+            repo,
+            token,
+            "issues/comments",
+            "issue",
+            limit,
+            cutoff,
+        )
+        review_comments = executor.submit(
+            _fetch_comment_endpoint,
+            repo,
+            token,
+            "pulls/comments",
+            "review",
+            limit,
+            cutoff,
+        )
+        comment_groups = [issue_comments.result(), review_comments.result()]
+    return _merge_comments(comment_groups, limit)
 
 
 def _fetch_commits(repo, token, limit, cutoff):
@@ -381,6 +399,34 @@ def _fetch_commits(repo, token, limit, cutoff):
     return commits[:limit]
 
 
+def _fetch_activity(repo, token, limit, cutoff):
+    jobs = {
+        "issues": (_fetch_issues, (repo, token, limit, cutoff)),
+        "prs": (_fetch_prs, (repo, token, limit, cutoff)),
+    }
+    if cutoff:
+        jobs.update(
+            {
+                "comments": (_fetch_comments, (repo, token, limit, cutoff)),
+                "commits": (_fetch_commits, (repo, token, limit, cutoff)),
+            }
+        )
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        futures = {
+            name: executor.submit(fetch, *args)
+            for name, (fetch, args) in jobs.items()
+        }
+        results = {name: future.result() for name, future in futures.items()}
+
+    return (
+        results["issues"],
+        results["prs"],
+        results.get("comments", []),
+        results.get("commits", []),
+    )
+
+
 def _mention_pattern(handle):
     normalized = handle.lstrip("@").strip()
     if not normalized:
@@ -408,12 +454,27 @@ def _emit_error(message, json_output, repo, timestamp, cutoff):
     print(f"Error: {message}", file=sys.stderr)
 
 
-def _timestamp_file_path():
+def _legacy_checkpoint_file_path():
     return os.path.join(os.getcwd(), LAST_UPDATE_FILENAME)
 
 
-def _load_last_update_timestamp():
-    path = _timestamp_file_path()
+def _state_home():
+    configured = os.environ.get("XDG_STATE_HOME")
+    if configured and os.path.isabs(configured):
+        return configured
+    return os.path.join(os.path.expanduser("~"), ".local", "state")
+
+
+def _checkpoint_directory():
+    return os.path.join(_state_home(), "ghp", "checkpoints")
+
+
+def _checkpoint_file_path(repo):
+    filename = urllib.parse.quote(repo.casefold(), safe="")
+    return os.path.join(_checkpoint_directory(), filename)
+
+
+def _read_timestamp_file(path):
     if not os.path.exists(path):
         return None
     with open(path, "r", encoding="utf-8") as fh:
@@ -423,10 +484,106 @@ def _load_last_update_timestamp():
     return _resolve_since(raw)
 
 
-def _save_last_update_timestamp(timestamp):
-    path = _timestamp_file_path()
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(timestamp + "\n")
+def _atomic_write_timestamp(path, timestamp):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=f".{os.path.basename(path)}.",
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(timestamp + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary_path, path)
+        try:
+            directory_fd = os.open(
+                directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_legacy_checkpoint_file():
+    path = _legacy_checkpoint_file_path()
+    if not os.path.exists(path):
+        return {}, None
+    with open(path, "r", encoding="utf-8") as fh:
+        raw = fh.read().strip()
+    if not raw:
+        return {}, None
+
+    try:
+        payload = json_mod.loads(raw)
+    except json_mod.JSONDecodeError:
+        return {}, _resolve_since(raw)
+
+    if not isinstance(payload, dict):
+        raise ValueError("invalid saved checkpoint: expected a repository map")
+
+    checkpoints = {}
+    for repo, timestamp in payload.items():
+        if not isinstance(repo, str) or not isinstance(timestamp, str):
+            raise ValueError("invalid saved checkpoint: expected repository timestamps")
+        checkpoints[repo.casefold()] = _resolve_since(timestamp)
+    return checkpoints, None
+
+
+def _migrate_local_checkpoints():
+    path = _legacy_checkpoint_file_path()
+    if not os.path.exists(path):
+        return None
+
+    checkpoints, legacy_timestamp = _read_legacy_checkpoint_file()
+    if legacy_timestamp:
+        return legacy_timestamp
+
+    for repo, timestamp in checkpoints.items():
+        checkpoint_path = _checkpoint_file_path(repo)
+        existing = _read_timestamp_file(checkpoint_path)
+        if not existing or _parse_iso8601(timestamp) > _parse_iso8601(existing):
+            _atomic_write_timestamp(checkpoint_path, timestamp)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def _load_last_update_timestamp(repo):
+    legacy_timestamp = _migrate_local_checkpoints()
+    if legacy_timestamp:
+        raise ValueError(
+            "saved checkpoint does not identify its repository; "
+            "use --since TIME once to establish a scoped checkpoint"
+        )
+    return _read_timestamp_file(_checkpoint_file_path(repo))
+
+
+def _save_last_update_timestamp(repo, timestamp):
+    legacy_timestamp = _migrate_local_checkpoints()
+    _atomic_write_timestamp(_checkpoint_file_path(repo), timestamp)
+    if legacy_timestamp:
+        try:
+            os.unlink(_legacy_checkpoint_file_path())
+        except FileNotFoundError:
+            pass
+
+
+def _checkpoint_timestamp(timestamp):
+    return _format_utc(_parse_iso8601(timestamp) - timedelta(seconds=1))
 
 
 def _fmt_commit(commit):
@@ -448,10 +605,16 @@ def main():
         description="Stateless GitHub activity summary — compact, LLM-friendly output",
     )
     parser.add_argument(
+        "target_or_since",
+        nargs="?",
+        metavar="upstream|TIME",
+        help="Use the upstream remote, or show deltas since TIME",
+    )
+    parser.add_argument(
         "since_pos",
         nargs="?",
         metavar="TIME",
-        help=argparse.SUPPRESS,
+        help="Show upstream deltas since TIME",
     )
     parser.add_argument(
         "--since",
@@ -474,11 +637,25 @@ def main():
         "--limit", type=int, default=30, help="Max items per category (default: 30)"
     )
     args = parser.parse_args()
-    if args.since and args.since_pos:
-        parser.error("use TIME or --since, not both")
+
+    remote = "origin"
+    if args.target_or_since == "upstream":
+        remote = "upstream"
+        raw_since = args.since or args.since_pos
+        if args.since and args.since_pos:
+            parser.error("use TIME or --since, not both")
+    else:
+        raw_since = args.since or args.target_or_since
+        if args.since_pos:
+            parser.error("only upstream may precede a positional TIME")
+        if args.since and args.target_or_since:
+            parser.error("use TIME or --since, not both")
+
+    if remote == "upstream" and args.repo:
+        parser.error("use upstream or --repo, not both")
 
     now = _format_utc(_utc_now())
-    repo = args.repo or _detect_repo()
+    repo = args.repo or _detect_repo(remote)
     cutoff = None
 
     if args.limit < 1:
@@ -486,8 +663,17 @@ def main():
         return 1
 
     if not repo:
+        if remote == "upstream":
+            message = (
+                "could not detect repo from git remote 'upstream'. "
+                "Add it or use --repo owner/name."
+            )
+        else:
+            message = (
+                "could not detect repo. Use --repo owner/name or run from a git checkout."
+            )
         _emit_error(
-            "could not detect repo. Use --repo owner/name or run from a git checkout.",
+            message,
             args.json,
             repo,
             now,
@@ -496,8 +682,11 @@ def main():
         return 1
 
     try:
-        raw_since = args.since or args.since_pos
-        cutoff = _resolve_since(raw_since) if raw_since else _load_last_update_timestamp()
+        cutoff = (
+            _resolve_since(raw_since)
+            if raw_since
+            else _load_last_update_timestamp(repo)
+        )
     except ValueError as exc:
         _emit_error(str(exc), args.json, repo, now, cutoff)
         return 1
@@ -505,10 +694,9 @@ def main():
     token = _get_token()
 
     try:
-        issues = _fetch_issues(repo, token, args.limit, cutoff)
-        prs = _fetch_prs(repo, token, args.limit, cutoff)
-        comments = _fetch_comments(repo, token, args.limit, cutoff)
-        commits = _fetch_commits(repo, token, args.limit, cutoff)
+        issues, prs, comments, commits = _fetch_activity(
+            repo, token, args.limit, cutoff
+        )
     except ApiError as exc:
         _emit_error(str(exc), args.json, repo, now, cutoff)
         return 1
@@ -573,7 +761,7 @@ def main():
             ],
         }
         print(json_mod.dumps(out, separators=(",", ":")))
-        _save_last_update_timestamp(now)
+        _save_last_update_timestamp(repo, _checkpoint_timestamp(now))
         return 0
 
     head = f"{repo} {now}"
@@ -601,7 +789,7 @@ def main():
     if not issues and not prs and not comments and not commits:
         print("none")
 
-    _save_last_update_timestamp(now)
+    _save_last_update_timestamp(repo, _checkpoint_timestamp(now))
 
     return 0
 

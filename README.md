@@ -21,18 +21,25 @@ uv run ghp --version
 
 ```bash
 ghp                                   # open issues + PRs snapshot
+ghp upstream                          # use the GitHub repo from the upstream remote
 ghp 1h                                # deltas since 1 hour ago
+ghp upstream 1h                       # upstream deltas since 1 hour ago
 ghp 2026-03-07T14:00:00Z              # deltas since timestamp
 ghp --json                            # machine-readable output
 ghp --me @clod                        # highlight mentions
 ghp --repo owner/name                 # explicit repo
-# default delta cursor comes from .ghp-last-update-timestamp if present
+# default delta cursor comes from the saved checkpoint for that GitHub repo
 ```
 
 ## Behavior
 
-- Cursor defaults to `.ghp-last-update-timestamp` in the current working directory when `--since` is omitted.
-- Successful runs autosave the current timestamp back to `.ghp-last-update-timestamp`.
+- Cursor defaults to the saved checkpoint for the current GitHub repository when `--since` is omitted.
+- `upstream` selects the repository configured as the Git remote named `upstream`.
+- Checkpoints are stored under `$XDG_STATE_HOME/ghp/checkpoints/`. When `XDG_STATE_HOME` is unset or invalid, ghp uses `~/.local/state/ghp/checkpoints/`.
+- Each repository has its own atomically replaced checkpoint file, so `origin`, `upstream`, and `--repo` queries do not advance each other's checkpoints.
+- Saved checkpoints include a one-second margin because GitHub's `since` filters are strict and timestamps have second precision. Boundary activity may appear again on the next run.
+- Tool installs and upgrades leave checkpoint state in place.
+- Repository-keyed `.ghp-last-update-timestamp` files are migrated to XDG state and removed after successful writes. Older plaintext files require an explicit window such as `ghp 1h` once because they do not identify a repository.
 - `--since` accepts relative shorthands (`30m`, `2h`, `1d`, `1w`) and normalizes timestamps to canonical UTC.
 - Snapshot mode returns open issues and open PRs.
 - Delta mode returns issues, PRs, issue comments, PR review comments, and recent commits since the cutoff.
