@@ -1,11 +1,11 @@
 import io
 import json
 import os
-import tempfile
 import sys
+import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 
 from ghp import cli
@@ -44,6 +44,7 @@ class DetectRepoTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
 
 
@@ -59,7 +60,10 @@ class MentionTests(unittest.TestCase):
 class FetchTests(unittest.TestCase):
     def test_fetch_issues_paginates_past_pull_requests(self):
         first_page = [
-            {"number": number, "pull_request": {"url": f"https://example.test/{number}"}}
+            {
+                "number": number,
+                "pull_request": {"url": f"https://example.test/{number}"},
+            }
             for number in range(1, 30)
         ]
         first_page.append({"number": 30, "title": "issue-30"})
@@ -73,7 +77,7 @@ class FetchTests(unittest.TestCase):
 
         self.assertEqual([30, 31, 32], [issue["number"] for issue in issues])
 
-    def test_fetch_comments_merges_issue_and_review_comments(self):
+    def test_merge_comments_sorts_and_limits_issue_and_review_comments(self):
         issue_comments = [
             {
                 "id": 10,
@@ -97,13 +101,7 @@ class FetchTests(unittest.TestCase):
             }
         ]
 
-        with mock.patch(
-            "ghp.cli._fetch_comment_endpoint",
-            side_effect=[issue_comments, review_comments],
-        ):
-            comments = cli._fetch_comments(
-                "owner/repo", "token", 1, "2026-03-07T15:00:00Z"
-            )
+        comments = cli._merge_comments([issue_comments, review_comments], 1)
 
         self.assertEqual([20], [comment["id"] for comment in comments])
         self.assertEqual("review", comments[0]["comment_type"])
@@ -154,17 +152,25 @@ class FetchTests(unittest.TestCase):
         }
         commit = {"sha": "abcdef123456"}
 
-        with mock.patch(
-            "ghp.cli._fetch_issues", side_effect=lambda *_: finish_together([issue])
-        ), mock.patch(
-            "ghp.cli._fetch_prs", side_effect=lambda *_: finish_together([pr])
-        ), mock.patch(
-            "ghp.cli._fetch_comment_endpoint",
-            side_effect=lambda *args: finish_together(
-                [issue_comment] if args[2] == "issues/comments" else [review_comment]
+        with (
+            mock.patch(
+                "ghp.cli._fetch_issues", side_effect=lambda *_: finish_together([issue])
             ),
-        ), mock.patch(
-            "ghp.cli._fetch_commits", side_effect=lambda *_: finish_together([commit])
+            mock.patch(
+                "ghp.cli._fetch_prs", side_effect=lambda *_: finish_together([pr])
+            ),
+            mock.patch(
+                "ghp.cli._fetch_comment_endpoint",
+                side_effect=lambda *args: finish_together(
+                    [issue_comment]
+                    if args[2] == "issues/comments"
+                    else [review_comment]
+                ),
+            ),
+            mock.patch(
+                "ghp.cli._fetch_commits",
+                side_effect=lambda *_: finish_together([commit]),
+            ),
         ):
             issues, prs, comments, commits = cli._fetch_activity(
                 "owner/repo", "token", 30, "2026-03-07T15:00:00Z"
@@ -176,15 +182,12 @@ class FetchTests(unittest.TestCase):
         self.assertEqual([commit], commits)
 
     def test_fetch_activity_skips_delta_endpoints_without_cutoff(self):
-        with mock.patch(
-            "ghp.cli._fetch_issues", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_prs", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_comment_endpoint"
-        ) as fetch_comments, mock.patch(
-            "ghp.cli._fetch_commits"
-        ) as fetch_commits:
+        with (
+            mock.patch("ghp.cli._fetch_issues", return_value=[]),
+            mock.patch("ghp.cli._fetch_prs", return_value=[]),
+            mock.patch("ghp.cli._fetch_comment_endpoint") as fetch_comments,
+            mock.patch("ghp.cli._fetch_commits") as fetch_commits,
+        ):
             self.assertEqual(
                 ([], [], [], []),
                 cli._fetch_activity("owner/repo", "token", 30, None),
@@ -196,27 +199,25 @@ class FetchTests(unittest.TestCase):
 
 class StateHomeTests(unittest.TestCase):
     def test_state_home_uses_absolute_xdg_location(self):
-        with mock.patch.dict(
-            os.environ, {"XDG_STATE_HOME": "/custom/state"}
-        ):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/custom/state"}):
             self.assertEqual("/custom/state", cli._state_home())
 
     def test_state_home_uses_standard_fallback_for_relative_xdg_location(self):
-        with mock.patch.dict(
-            os.environ, {"XDG_STATE_HOME": "relative/state"}
-        ), mock.patch(
-            "ghp.cli.os.path.expanduser", return_value="/home/test-user"
+        with (
+            mock.patch.dict(os.environ, {"XDG_STATE_HOME": "relative/state"}),
+            mock.patch("ghp.cli.os.path.expanduser", return_value="/home/test-user"),
         ):
             self.assertEqual("/home/test-user/.local/state", cli._state_home())
 
     def test_state_home_uses_standard_fallback_when_xdg_location_is_unset(self):
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
-            "ghp.cli.os.path.expanduser", return_value="/home/test-user"
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("ghp.cli.os.path.expanduser", return_value="/home/test-user"),
         ):
             self.assertEqual("/home/test-user/.local/state", cli._state_home())
 
 
-class TimestampFileTests(unittest.TestCase):
+class CheckpointTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.repo_dir = os.path.join(self.tempdir.name, "repo")
@@ -234,46 +235,44 @@ class TimestampFileTests(unittest.TestCase):
         self.state_patcher.stop()
         self.tempdir.cleanup()
 
-    def test_load_last_update_timestamp_returns_none_when_missing(self):
-        self.assertIsNone(cli._load_last_update_timestamp("owner/repo"))
+    def test_load_checkpoint_returns_none_when_missing(self):
+        self.assertIsNone(cli._load_checkpoint("owner/repo"))
 
-    def test_save_and_load_last_update_timestamps_by_repo(self):
-        cli._save_last_update_timestamp("owner/one", "2026-03-09T12:00:00Z")
-        cli._save_last_update_timestamp("owner/two", "2026-03-09T13:00:00Z")
+    def test_save_and_load_checkpoints_by_repo(self):
+        cli._save_checkpoint("owner/one", "2026-03-09T12:00:00Z")
+        cli._save_checkpoint("owner/two", "2026-03-09T13:00:00Z")
 
         self.assertEqual(
             "2026-03-09T12:00:00Z",
-            cli._load_last_update_timestamp("OWNER/ONE"),
+            cli._load_checkpoint("OWNER/ONE"),
         )
         self.assertEqual(
             "2026-03-09T13:00:00Z",
-            cli._load_last_update_timestamp("owner/two"),
+            cli._load_checkpoint("owner/two"),
         )
         self.assertTrue(
             os.path.exists(
-                os.path.join(
-                    self.state_dir, "ghp", "checkpoints", "owner%2Fone"
-                )
+                os.path.join(self.state_dir, "ghp", "checkpoints", "owner%2Fone")
             )
         )
 
     def test_legacy_checkpoint_requires_an_explicit_window(self):
-        legacy_path = os.path.join(self.repo_dir, cli.LAST_UPDATE_FILENAME)
+        legacy_path = os.path.join(self.repo_dir, cli.LEGACY_CHECKPOINT_FILENAME)
         with open(legacy_path, "w", encoding="utf-8") as fh:
             fh.write("2026-03-09T12:00:00Z\n")
 
         with self.assertRaisesRegex(ValueError, "does not identify its repository"):
-            cli._load_last_update_timestamp("owner/repo")
+            cli._load_checkpoint("owner/repo")
 
-        cli._save_last_update_timestamp("owner/repo", "2026-03-09T13:00:00Z")
+        cli._save_checkpoint("owner/repo", "2026-03-09T13:00:00Z")
         self.assertEqual(
             "2026-03-09T13:00:00Z",
-            cli._load_last_update_timestamp("owner/repo"),
+            cli._load_checkpoint("owner/repo"),
         )
         self.assertFalse(os.path.exists(legacy_path))
 
     def test_repository_map_is_migrated_before_local_file_is_removed(self):
-        legacy_path = os.path.join(self.repo_dir, cli.LAST_UPDATE_FILENAME)
+        legacy_path = os.path.join(self.repo_dir, cli.LEGACY_CHECKPOINT_FILENAME)
         with open(legacy_path, "w", encoding="utf-8") as fh:
             json.dump(
                 {
@@ -285,26 +284,26 @@ class TimestampFileTests(unittest.TestCase):
 
         self.assertEqual(
             "2026-03-09T12:00:00Z",
-            cli._load_last_update_timestamp("owner/one"),
+            cli._load_checkpoint("owner/one"),
         )
         self.assertEqual(
             "2026-03-09T13:00:00Z",
-            cli._load_last_update_timestamp("owner/two"),
+            cli._load_checkpoint("owner/two"),
         )
         self.assertFalse(os.path.exists(legacy_path))
 
     def test_failed_atomic_replace_preserves_previous_checkpoint(self):
-        cli._save_last_update_timestamp("owner/repo", "2026-03-09T12:00:00Z")
+        cli._save_checkpoint("owner/repo", "2026-03-09T12:00:00Z")
 
-        with mock.patch("ghp.cli.os.replace", side_effect=OSError("boom")):
-            with self.assertRaisesRegex(OSError, "boom"):
-                cli._save_last_update_timestamp(
-                    "owner/repo", "2026-03-09T13:00:00Z"
-                )
+        with (
+            mock.patch("ghp.cli.os.replace", side_effect=OSError("boom")),
+            self.assertRaisesRegex(OSError, "boom"),
+        ):
+            cli._save_checkpoint("owner/repo", "2026-03-09T13:00:00Z")
 
         self.assertEqual(
             "2026-03-09T12:00:00Z",
-            cli._load_last_update_timestamp("owner/repo"),
+            cli._load_checkpoint("owner/repo"),
         )
         checkpoint_dir = os.path.join(self.state_dir, "ghp", "checkpoints")
         self.assertEqual(["owner%2Frepo"], os.listdir(checkpoint_dir))
@@ -322,76 +321,70 @@ class MainTests(unittest.TestCase):
         self.state_patcher.stop()
         self.state_tempdir.cleanup()
 
+    def _run(self, argv, activity=None, now=None, cwd=None, fetch=None):
+        stdout = io.StringIO()
+        activity = activity or ([], [], [], [])
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", ["ghp", *argv]))
+            if fetch is None:
+                fetch = stack.enter_context(
+                    mock.patch("ghp.cli._fetch_activity", return_value=activity)
+                )
+            if now:
+                stack.enter_context(
+                    mock.patch("ghp.cli._utc_now", return_value=cli._parse_iso8601(now))
+                )
+            if cwd:
+                stack.enter_context(mock.patch("os.getcwd", return_value=cwd))
+            stack.enter_context(redirect_stdout(stdout))
+            code = cli.main()
+        return code, stdout.getvalue(), fetch
+
     def test_main_emits_version(self):
         stdout = io.StringIO()
 
-        with mock.patch.object(
-            sys, "argv", ["ghp", "--version"]
-        ), mock.patch(
-            "ghp.cli._pkg_version", return_value="0.1.0"
-        ), redirect_stdout(stdout):
-            with self.assertRaises(SystemExit) as exc:
-                cli.main()
+        with (
+            mock.patch.object(sys, "argv", ["ghp", "--version"]),
+            mock.patch("ghp.cli._pkg_version", return_value="0.1.0"),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cli.main()
 
         self.assertEqual(0, exc.exception.code)
         self.assertEqual("ghp 0.1.0\n", stdout.getvalue())
 
     def test_main_emits_json_error_and_nonzero_exit_on_api_failure(self):
-        stdout = io.StringIO()
-
-        with mock.patch.object(
-            sys, "argv", ["ghp", "--json", "--repo", "owner/repo"]
-        ), mock.patch(
+        with mock.patch(
             "ghp.cli._fetch_activity", side_effect=cli.ApiError("boom")
-        ), redirect_stdout(stdout):
-            code = cli.main()
+        ) as fetch:
+            code, output, _fetch = self._run(
+                ["--json", "--repo", "owner/repo"], fetch=fetch
+            )
 
         self.assertEqual(1, code)
-        payload = json.loads(stdout.getvalue())
+        payload = json.loads(output)
         self.assertEqual("owner/repo", payload["repo"])
         self.assertEqual("boom", payload["error"])
 
-    def test_main_uses_last_update_file_when_since_is_omitted(self):
-        stdout = io.StringIO()
+    def test_main_uses_checkpoint_when_since_is_omitted(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            timestamp_path = os.path.join(tmpdir, cli.LAST_UPDATE_FILENAME)
+            timestamp_path = os.path.join(tmpdir, cli.LEGACY_CHECKPOINT_FILENAME)
             with open(timestamp_path, "w", encoding="utf-8") as fh:
                 json.dump({"owner/repo": "2026-03-07T15:00:00Z"}, fh)
 
-            with mock.patch.object(
-                sys, "argv", ["ghp", "--repo", "owner/repo"]
-            ), mock.patch("os.getcwd", return_value=tmpdir), mock.patch(
-                "ghp.cli._fetch_issues", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_prs", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_comments", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_commits", return_value=[]
-            ), redirect_stdout(stdout):
-                code = cli.main()
+            code, output, _fetch = self._run(["--repo", "owner/repo"], cwd=tmpdir)
 
         self.assertEqual(0, code)
-        self.assertIn("since=2026-03-07T15:00:00Z", stdout.getvalue())
+        self.assertIn("since=2026-03-07T15:00:00Z", output)
 
-    def test_main_autosaves_last_update_timestamp_on_success(self):
-        stdout = io.StringIO()
+    def test_main_saves_checkpoint_on_success(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with mock.patch.object(
-                sys, "argv", ["ghp", "--repo", "owner/repo"]
-            ), mock.patch("os.getcwd", return_value=tmpdir), mock.patch(
-                "ghp.cli._fetch_issues", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_prs", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_comments", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_commits", return_value=[]
-            ), mock.patch(
-                "ghp.cli._utc_now",
-                return_value=cli._parse_iso8601("2026-03-09T12:34:56Z"),
-            ), redirect_stdout(stdout):
-                code = cli.main()
+            code, _output, _fetch = self._run(
+                ["--repo", "owner/repo"],
+                now="2026-03-09T12:34:56Z",
+                cwd=tmpdir,
+            )
 
             self.assertEqual(0, code)
             with open(
@@ -399,11 +392,10 @@ class MainTests(unittest.TestCase):
             ) as fh:
                 self.assertEqual("2026-03-09T12:34:55Z", fh.read().strip())
             self.assertFalse(
-                os.path.exists(os.path.join(tmpdir, cli.LAST_UPDATE_FILENAME))
+                os.path.exists(os.path.join(tmpdir, cli.LEGACY_CHECKPOINT_FILENAME))
             )
 
     def test_main_includes_commits_in_json_output(self):
-        stdout = io.StringIO()
         commits = [
             {
                 "sha": "abcdef123456",
@@ -416,27 +408,17 @@ class MainTests(unittest.TestCase):
             }
         ]
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with mock.patch.object(
-                sys, "argv", ["ghp", "--json", "--repo", "owner/repo", "--since", "1h"]
-            ), mock.patch("os.getcwd", return_value=tmpdir), mock.patch(
-                "ghp.cli._fetch_issues", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_prs", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_comments", return_value=[]
-            ), mock.patch(
-                "ghp.cli._fetch_commits", return_value=commits
-            ), redirect_stdout(stdout):
-                code = cli.main()
+        code, output, _fetch = self._run(
+            ["--json", "--repo", "owner/repo", "--since", "1h"],
+            activity=([], [], [], commits),
+        )
 
         self.assertEqual(0, code)
-        payload = json.loads(stdout.getvalue())
+        payload = json.loads(output)
         self.assertEqual("abcdef123456", payload["commits"][0]["sha"])
         self.assertEqual("Fix bug", payload["commits"][0]["message"])
 
     def test_main_emits_compact_text_output(self):
-        stdout = io.StringIO()
         issue = {
             "number": 7,
             "state": "open",
@@ -476,112 +458,58 @@ class MainTests(unittest.TestCase):
             }
         ]
 
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["ghp", "--repo", "owner/repo", "--since", "1h", "--me", "@clod"],
-        ), mock.patch("ghp.cli._utc_now", return_value=cli._parse_iso8601("2026-03-07T18:00:00Z")), mock.patch(
-            "ghp.cli._fetch_issues", return_value=[issue]
-        ), mock.patch("ghp.cli._fetch_prs", return_value=[pr]), mock.patch(
-            "ghp.cli._fetch_comments", return_value=[comment]
-        ), mock.patch(
-            "ghp.cli._fetch_commits", return_value=commits
-        ), redirect_stdout(stdout):
-            code = cli.main()
-
-        self.assertEqual(0, code)
-        self.assertEqual(
-            "\n".join(
-                [
-                    "owner/repo 2026-03-07T18:00:00Z since=2026-03-07T17:00:00Z",
-                    "issues 1",
-                    "#7 open @alice trim output l:bug,p1 c:2",
-                    "pr 1",
-                    "#9 open,draft @bob feat->main ship less text c:1 rc:3",
-                    "comments 1",
-                    "#9 review @carol 2026-03-07T17:00:00Z: ping @clod with the latest diff",
-                    "commits 1",
-                    "abcdef1 @dave 2026-03-07T17:30:00Z tighten output",
-                    "@clod 1",
-                    "#9 review @carol 2026-03-07T17:00:00Z: ping @clod with the latest diff",
-                    "",
-                ]
-            ),
-            stdout.getvalue(),
+        code, output, _fetch = self._run(
+            ["--repo", "owner/repo", "--since", "1h", "--me", "@clod"],
+            activity=([issue], [pr], [comment], commits),
+            now="2026-03-07T18:00:00Z",
         )
 
-    def test_main_accepts_positional_since_shorthand(self):
-        stdout = io.StringIO()
+        self.assertEqual(0, code)
+        expected = """owner/repo 2026-03-07T18:00:00Z since=2026-03-07T17:00:00Z
+issues 1
+#7 open @alice trim output l:bug,p1 c:2
+pr 1
+#9 open,draft @bob feat->main ship less text c:1 rc:3
+comments 1
+#9 review @carol 2026-03-07T17:00:00Z: ping @clod with the latest diff
+commits 1
+abcdef1 @dave 2026-03-07T17:30:00Z tighten output
+@clod 1
+#9 review @carol 2026-03-07T17:00:00Z: ping @clod with the latest diff
+"""
+        self.assertEqual(expected, output)
 
-        with mock.patch.object(
-            sys, "argv", ["ghp", "1h", "--repo", "owner/repo"]
-        ), mock.patch(
-            "ghp.cli._utc_now",
-            return_value=cli._parse_iso8601("2026-03-07T18:00:00Z"),
-        ), mock.patch(
-            "ghp.cli._fetch_issues", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_prs", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_comments", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_commits", return_value=[]
-        ), redirect_stdout(stdout):
-            code = cli.main()
+    def test_main_accepts_positional_since_shorthand(self):
+        code, output, _fetch = self._run(
+            ["1h", "--repo", "owner/repo"], now="2026-03-07T18:00:00Z"
+        )
 
         self.assertEqual(0, code)
         self.assertTrue(
-            stdout.getvalue().startswith(
+            output.startswith(
                 "owner/repo 2026-03-07T18:00:00Z since=2026-03-07T17:00:00Z"
             )
         )
 
     def test_main_uses_upstream_remote(self):
-        stdout = io.StringIO()
-
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
-            sys, "argv", ["ghp", "upstream"]
-        ), mock.patch("os.getcwd", return_value=tmpdir), mock.patch(
+        with mock.patch(
             "ghp.cli._detect_repo", return_value="source/project"
-        ) as detect_repo, mock.patch(
-            "ghp.cli._fetch_issues", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_prs", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_comments", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_commits", return_value=[]
-        ), redirect_stdout(stdout):
-            code = cli.main()
+        ) as detect_repo:
+            code, output, _fetch = self._run(["upstream"])
 
         self.assertEqual(0, code)
         detect_repo.assert_called_once_with("upstream")
-        self.assertTrue(stdout.getvalue().startswith("source/project "))
+        self.assertTrue(output.startswith("source/project "))
 
     def test_main_accepts_upstream_with_positional_since(self):
-        stdout = io.StringIO()
-
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
-            sys, "argv", ["ghp", "upstream", "1h"]
-        ), mock.patch("os.getcwd", return_value=tmpdir), mock.patch(
-            "ghp.cli._detect_repo", return_value="source/project"
-        ), mock.patch(
-            "ghp.cli._utc_now",
-            return_value=cli._parse_iso8601("2026-03-07T18:00:00Z"),
-        ), mock.patch(
-            "ghp.cli._fetch_issues", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_prs", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_comments", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_commits", return_value=[]
-        ), redirect_stdout(stdout):
-            code = cli.main()
+        with mock.patch("ghp.cli._detect_repo", return_value="source/project"):
+            code, output, _fetch = self._run(
+                ["upstream", "1h"], now="2026-03-07T18:00:00Z"
+            )
 
         self.assertEqual(0, code)
         self.assertTrue(
-            stdout.getvalue().startswith(
+            output.startswith(
                 "source/project 2026-03-07T18:00:00Z since=2026-03-07T17:00:00Z"
             )
         )
@@ -589,12 +517,10 @@ class MainTests(unittest.TestCase):
     def test_main_reports_missing_upstream_remote(self):
         stderr = io.StringIO()
 
-        with mock.patch.object(
-            sys, "argv", ["ghp", "upstream"]
-        ), mock.patch(
-            "ghp.cli._detect_repo", return_value=None
-        ), mock.patch(
-            "sys.stderr", stderr
+        with (
+            mock.patch.object(sys, "argv", ["ghp", "upstream"]),
+            mock.patch("ghp.cli._detect_repo", return_value=None),
+            mock.patch("sys.stderr", stderr),
         ):
             code = cli.main()
 
@@ -602,42 +528,28 @@ class MainTests(unittest.TestCase):
         self.assertIn("git remote 'upstream'", stderr.getvalue())
 
     def test_main_does_not_share_checkpoint_between_repositories(self):
-        stdout = io.StringIO()
+        with (
+            mock.patch(
+                "ghp.cli._detect_repo",
+                side_effect=lambda remote: {
+                    "origin": "owner/fork",
+                    "upstream": "source/project",
+                }[remote],
+            ),
+            mock.patch(
+                "ghp.cli._fetch_activity", return_value=([], [], [], [])
+            ) as fetch,
+        ):
+            code, _output, _fetch = self._run(
+                [], now="2026-08-20T15:23:05Z", fetch=fetch
+            )
+            self.assertEqual(0, code)
+            code, _output, _fetch = self._run(
+                ["upstream"], now="2026-08-20T16:10:35Z", fetch=fetch
+            )
+            self.assertEqual(0, code)
 
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch(
-            "os.getcwd", return_value=tmpdir
-        ), mock.patch(
-            "ghp.cli._detect_repo",
-            side_effect=lambda remote: {
-                "origin": "owner/fork",
-                "upstream": "source/project",
-            }[remote],
-        ), mock.patch(
-            "ghp.cli._fetch_issues", return_value=[]
-        ) as fetch_issues, mock.patch(
-            "ghp.cli._fetch_prs", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_comments", return_value=[]
-        ), mock.patch(
-            "ghp.cli._fetch_commits", return_value=[]
-        ), redirect_stdout(stdout):
-            with mock.patch.object(
-                sys, "argv", ["ghp"]
-            ), mock.patch(
-                "ghp.cli._utc_now",
-                return_value=cli._parse_iso8601("2026-08-20T15:23:05Z"),
-            ):
-                self.assertEqual(0, cli.main())
-
-            with mock.patch.object(
-                sys, "argv", ["ghp", "upstream"]
-            ), mock.patch(
-                "ghp.cli._utc_now",
-                return_value=cli._parse_iso8601("2026-08-20T16:10:35Z"),
-            ):
-                self.assertEqual(0, cli.main())
-
-        self.assertIsNone(fetch_issues.call_args_list[1].args[3])
+        self.assertIsNone(fetch.call_args_list[1].args[3])
 
 
 if __name__ == "__main__":

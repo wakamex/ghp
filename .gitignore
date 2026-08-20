@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.egg-info/
+.venv/
 dist/
+benchmarks/**/target/
 .ghp-last-update-timestamp
 .gh-pulse-last-update-timestamp

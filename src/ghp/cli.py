@@ -1,6 +1,4 @@
-"""Stateless GitHub activity summary for a repo.
-
-Compact, LLM-friendly output. Caller owns the cursor via --since.
+"""Compact GitHub activity summary with repository-scoped checkpoints.
 
 Usage:
     ghp                               # snapshot: open issues + PRs
@@ -14,7 +12,7 @@ Usage:
 """
 
 import argparse
-import json as json_mod
+import json
 import os
 import re
 import subprocess
@@ -29,7 +27,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 ISO_8601_UTC = "%Y-%m-%dT%H:%M:%SZ"
 GITHUB_HANDLE_CHARS = "A-Za-z0-9-"
-LAST_UPDATE_FILENAME = ".ghp-last-update-timestamp"
+LEGACY_CHECKPOINT_FILENAME = ".ghp-last-update-timestamp"
 
 
 class ApiError(RuntimeError):
@@ -70,7 +68,11 @@ def _get_token():
             return tok
     try:
         result = subprocess.run(
-            ["gh", "auth", "token"], capture_output=True, text=True, timeout=5
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -87,6 +89,7 @@ def _detect_repo(remote="origin"):
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
         url = result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -113,13 +116,13 @@ def _api(path, token, params=None):
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json_mod.loads(resp.read())
+            return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            payload = json_mod.loads(exc.read().decode())
+            payload = json.loads(exc.read().decode())
             detail = payload.get("message", "")
-        except Exception:
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
             detail = ""
         suffix = f" ({detail})" if detail else ""
         raise ApiError(f"API error: {exc.code} {exc.reason} for {url}{suffix}") from exc
@@ -134,9 +137,7 @@ def _resolve_since(raw):
 
     match = re.match(r"^(\d+)([mhdw])$", raw)
     if not match:
-        raise ValueError(
-            f"invalid --since: {raw} (use 30m, 2h, 1d, 1w, or ISO 8601)"
-        )
+        raise ValueError(f"invalid --since: {raw} (use 30m, 2h, 1d, 1w, or ISO 8601)")
 
     num, unit = int(match.group(1)), match.group(2)
     delta = {
@@ -150,16 +151,16 @@ def _resolve_since(raw):
 
 def _fmt_issue(issue):
     parts = [
-        f'#{issue["number"]}',
+        f"#{issue['number']}",
         issue["state"],
-        f'@{issue["user"]["login"]}',
+        f"@{issue['user']['login']}",
         issue["title"],
     ]
     labels = ",".join(label["name"] for label in issue.get("labels", []))
     if labels:
         parts.append(f"l:{labels}")
     if issue.get("comments"):
-        parts.append(f'c:{issue["comments"]}')
+        parts.append(f"c:{issue['comments']}")
     return " ".join(parts)
 
 
@@ -169,16 +170,16 @@ def _fmt_pr(pr):
         status = f"{status},draft"
 
     parts = [
-        f'#{pr["number"]}',
+        f"#{pr['number']}",
         status,
-        f'@{pr["user"]["login"]}',
-        f'{pr["head"]["ref"]}->{pr["base"]["ref"]}',
+        f"@{pr['user']['login']}",
+        f"{pr['head']['ref']}->{pr['base']['ref']}",
         pr["title"],
     ]
     if isinstance(pr.get("comments"), int) and pr["comments"] > 0:
-        parts.append(f'c:{pr["comments"]}')
+        parts.append(f"c:{pr['comments']}")
     if isinstance(pr.get("review_comments"), int) and pr["review_comments"] > 0:
-        parts.append(f'rc:{pr["review_comments"]}')
+        parts.append(f"rc:{pr['review_comments']}")
     return " ".join(parts)
 
 
@@ -328,7 +329,9 @@ def _fetch_comment_endpoint(repo, token, path, comment_type, limit, cutoff):
 
 def _comment_sort_key(comment):
     updated_at = _parse_iso8601(_comment_timestamp(comment))
-    created_at = _parse_iso8601(comment.get("created_at") or _comment_timestamp(comment))
+    created_at = _parse_iso8601(
+        comment.get("created_at") or _comment_timestamp(comment)
+    )
     return (updated_at, created_at, comment.get("id", 0))
 
 
@@ -338,33 +341,6 @@ def _merge_comments(comment_groups, limit):
         merged.extend(group)
     merged.sort(key=_comment_sort_key, reverse=True)
     return merged[:limit]
-
-
-def _fetch_comments(repo, token, limit, cutoff):
-    if not cutoff:
-        return []
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        issue_comments = executor.submit(
-            _fetch_comment_endpoint,
-            repo,
-            token,
-            "issues/comments",
-            "issue",
-            limit,
-            cutoff,
-        )
-        review_comments = executor.submit(
-            _fetch_comment_endpoint,
-            repo,
-            token,
-            "pulls/comments",
-            "review",
-            limit,
-            cutoff,
-        )
-        comment_groups = [issue_comments.result(), review_comments.result()]
-    return _merge_comments(comment_groups, limit)
 
 
 def _fetch_commits(repo, token, limit, cutoff):
@@ -407,22 +383,47 @@ def _fetch_activity(repo, token, limit, cutoff):
     if cutoff:
         jobs.update(
             {
-                "comments": (_fetch_comments, (repo, token, limit, cutoff)),
+                "issue_comments": (
+                    _fetch_comment_endpoint,
+                    (
+                        repo,
+                        token,
+                        "issues/comments",
+                        "issue",
+                        limit,
+                        cutoff,
+                    ),
+                ),
+                "review_comments": (
+                    _fetch_comment_endpoint,
+                    (
+                        repo,
+                        token,
+                        "pulls/comments",
+                        "review",
+                        limit,
+                        cutoff,
+                    ),
+                ),
                 "commits": (_fetch_commits, (repo, token, limit, cutoff)),
             }
         )
 
     with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
         futures = {
-            name: executor.submit(fetch, *args)
-            for name, (fetch, args) in jobs.items()
+            name: executor.submit(fetch, *args) for name, (fetch, args) in jobs.items()
         }
         results = {name: future.result() for name, future in futures.items()}
 
+    comments = (
+        _merge_comments([results["issue_comments"], results["review_comments"]], limit)
+        if cutoff
+        else []
+    )
     return (
         results["issues"],
         results["prs"],
-        results.get("comments", []),
+        comments,
         results.get("commits", []),
     )
 
@@ -440,7 +441,7 @@ def _mention_pattern(handle):
 def _emit_error(message, json_output, repo, timestamp, cutoff):
     if json_output:
         print(
-            json_mod.dumps(
+            json.dumps(
                 {
                     "repo": repo,
                     "timestamp": timestamp,
@@ -455,7 +456,7 @@ def _emit_error(message, json_output, repo, timestamp, cutoff):
 
 
 def _legacy_checkpoint_file_path():
-    return os.path.join(os.getcwd(), LAST_UPDATE_FILENAME)
+    return os.path.join(os.getcwd(), LEGACY_CHECKPOINT_FILENAME)
 
 
 def _state_home():
@@ -526,17 +527,17 @@ def _read_legacy_checkpoint_file():
         return {}, None
 
     try:
-        payload = json_mod.loads(raw)
-    except json_mod.JSONDecodeError:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
         return {}, _resolve_since(raw)
 
     if not isinstance(payload, dict):
-        raise ValueError("invalid saved checkpoint: expected a repository map")
+        raise TypeError("invalid saved checkpoint: expected a repository map")
 
     checkpoints = {}
     for repo, timestamp in payload.items():
         if not isinstance(repo, str) or not isinstance(timestamp, str):
-            raise ValueError("invalid saved checkpoint: expected repository timestamps")
+            raise TypeError("invalid saved checkpoint: expected repository timestamps")
         checkpoints[repo.casefold()] = _resolve_since(timestamp)
     return checkpoints, None
 
@@ -562,7 +563,7 @@ def _migrate_local_checkpoints():
     return None
 
 
-def _load_last_update_timestamp(repo):
+def _load_checkpoint(repo):
     legacy_timestamp = _migrate_local_checkpoints()
     if legacy_timestamp:
         raise ValueError(
@@ -572,7 +573,7 @@ def _load_last_update_timestamp(repo):
     return _read_timestamp_file(_checkpoint_file_path(repo))
 
 
-def _save_last_update_timestamp(repo, timestamp):
+def _save_checkpoint(repo, timestamp):
     legacy_timestamp = _migrate_local_checkpoints()
     _atomic_write_timestamp(_checkpoint_file_path(repo), timestamp)
     if legacy_timestamp:
@@ -599,10 +600,73 @@ def _fmt_commit(commit):
     return f"{sha} @{author} {date} {summary}"
 
 
+def _json_payload(repo, timestamp, cutoff, issues, prs, comments, commits):
+    return {
+        "repo": repo,
+        "timestamp": timestamp,
+        "since": cutoff,
+        "issues": [
+            {
+                "number": issue["number"],
+                "title": issue["title"],
+                "state": issue["state"],
+                "user": issue["user"]["login"],
+                "labels": [label["name"] for label in issue.get("labels", [])],
+                "updated_at": issue["updated_at"],
+                "created_at": issue["created_at"],
+                "comments": issue.get("comments", 0),
+            }
+            for issue in issues
+        ],
+        "pull_requests": [
+            {
+                "number": pr["number"],
+                "title": pr["title"],
+                "state": pr["state"],
+                "user": pr["user"]["login"],
+                "base": pr["base"]["ref"],
+                "head": pr["head"]["ref"],
+                "draft": pr.get("draft", False),
+                "updated_at": pr["updated_at"],
+                "created_at": pr["created_at"],
+                "review_comments": pr.get("review_comments"),
+                "comments": pr.get("comments"),
+            }
+            for pr in prs
+        ],
+        "recent_comments": [
+            {
+                "number": _comment_number(comment),
+                "comment_type": comment.get("comment_type", "issue"),
+                "user": comment["user"]["login"],
+                "created_at": comment.get("created_at"),
+                "updated_at": comment.get("updated_at"),
+                "body": _trim_comment_body(comment.get("body"), 200),
+            }
+            for comment in comments
+        ],
+        "commits": [
+            {
+                "sha": commit.get("sha"),
+                "message": (
+                    (commit.get("commit") or {}).get("message") or ""
+                ).splitlines()[0],
+                "author": (
+                    ((commit.get("author") or {}).get("login"))
+                    or ((commit.get("commit") or {}).get("author") or {}).get("name")
+                ),
+                "date": ((commit.get("commit") or {}).get("author") or {}).get("date"),
+                "url": commit.get("html_url"),
+            }
+            for commit in commits
+        ],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="ghp",
-        description="Stateless GitHub activity summary — compact, LLM-friendly output",
+        description="Compact GitHub activity summary with repository-scoped checkpoints",
     )
     parser.add_argument(
         "target_or_since",
@@ -669,9 +733,7 @@ def main():
                 "Add it or use --repo owner/name."
             )
         else:
-            message = (
-                "could not detect repo. Use --repo owner/name or run from a git checkout."
-            )
+            message = "could not detect repo. Use --repo owner/name or run from a git checkout."
         _emit_error(
             message,
             args.json,
@@ -682,12 +744,8 @@ def main():
         return 1
 
     try:
-        cutoff = (
-            _resolve_since(raw_since)
-            if raw_since
-            else _load_last_update_timestamp(repo)
-        )
-    except ValueError as exc:
+        cutoff = _resolve_since(raw_since) if raw_since else _load_checkpoint(repo)
+    except (TypeError, ValueError) as exc:
         _emit_error(str(exc), args.json, repo, now, cutoff)
         return 1
 
@@ -702,66 +760,9 @@ def main():
         return 1
 
     if args.json:
-        out = {
-            "repo": repo,
-            "timestamp": now,
-            "since": cutoff,
-            "issues": [
-                {
-                    "number": issue["number"],
-                    "title": issue["title"],
-                    "state": issue["state"],
-                    "user": issue["user"]["login"],
-                    "labels": [label["name"] for label in issue.get("labels", [])],
-                    "updated_at": issue["updated_at"],
-                    "created_at": issue["created_at"],
-                    "comments": issue.get("comments", 0),
-                }
-                for issue in issues
-            ],
-            "pull_requests": [
-                {
-                    "number": pr["number"],
-                    "title": pr["title"],
-                    "state": pr["state"],
-                    "user": pr["user"]["login"],
-                    "base": pr["base"]["ref"],
-                    "head": pr["head"]["ref"],
-                    "draft": pr.get("draft", False),
-                    "updated_at": pr["updated_at"],
-                    "created_at": pr["created_at"],
-                    "review_comments": pr.get("review_comments"),
-                    "comments": pr.get("comments"),
-                }
-                for pr in prs
-            ],
-            "recent_comments": [
-                {
-                    "number": _comment_number(comment),
-                    "comment_type": comment.get("comment_type", "issue"),
-                    "user": comment["user"]["login"],
-                    "created_at": comment.get("created_at"),
-                    "updated_at": comment.get("updated_at"),
-                    "body": _trim_comment_body(comment.get("body"), 200),
-                }
-                for comment in comments
-            ],
-            "commits": [
-                {
-                    "sha": commit.get("sha"),
-                    "message": ((commit.get("commit") or {}).get("message") or "").splitlines()[0],
-                    "author": (
-                        ((commit.get("author") or {}).get("login"))
-                        or ((commit.get("commit") or {}).get("author") or {}).get("name")
-                    ),
-                    "date": ((commit.get("commit") or {}).get("author") or {}).get("date"),
-                    "url": commit.get("html_url"),
-                }
-                for commit in commits
-            ],
-        }
-        print(json_mod.dumps(out, separators=(",", ":")))
-        _save_last_update_timestamp(repo, _checkpoint_timestamp(now))
+        out = _json_payload(repo, now, cutoff, issues, prs, comments, commits)
+        print(json.dumps(out, separators=(",", ":")))
+        _save_checkpoint(repo, _checkpoint_timestamp(now))
         return 0
 
     head = f"{repo} {now}"
@@ -778,7 +779,9 @@ def main():
     mention_re = _mention_pattern(args.me) if args.me else None
     if mention_re and comments:
         hits = [
-            comment for comment in comments if mention_re.search(comment.get("body") or "")
+            comment
+            for comment in comments
+            if mention_re.search(comment.get("body") or "")
         ]
         if hits:
             handle = args.me.lstrip("@")
@@ -789,7 +792,7 @@ def main():
     if not issues and not prs and not comments and not commits:
         print("none")
 
-    _save_last_update_timestamp(repo, _checkpoint_timestamp(now))
+    _save_checkpoint(repo, _checkpoint_timestamp(now))
 
     return 0
 
