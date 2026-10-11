@@ -28,6 +28,9 @@ ghp 2026-03-07T14:00:00Z              # deltas since timestamp
 ghp --json                            # machine-readable output
 ghp --me @clod                        # highlight mentions
 ghp --repo owner/name                 # explicit repo
+ghp inbox                             # unread notifications across all repositories
+ghp inbox 1d                          # read and unread notifications since 1 day ago
+ghp inbox --repo owner/name           # unread notifications for one repository
 ```
 
 ## Behavior
@@ -49,6 +52,9 @@ ghp --repo owner/name                 # explicit repo
   canonical UTC.
 - Snapshot mode returns open issues and open PRs.
 - Delta mode returns issues, PRs, issue comments, PR review comments, and recent commits since the cutoff.
+- `inbox` lists the authenticated account's notifications, grouped by repository and newest first. It ignores the current checkout and reads and writes no checkpoint: GitHub's unread state is the cursor, and ghp never marks a notification as read.
+- `inbox` alone returns unread notifications. With a TIME it returns read and unread notifications updated since then, and marks the read ones `read`.
+- Each inbox line gives the issue or pull request number (or short commit hash), the subject type, the reason GitHub sent it (such as `mention`, `review_requested`, or `author`), the update time, and the title.
 - API or auth failures exit non-zero instead of silently pretending there was no activity.
 - `--json` prints a machine-readable payload; on failure it emits a JSON object with an `error` field
   and exits non-zero.
@@ -61,6 +67,8 @@ Looks for tokens in this order:
 2. `$GITHUB_TOKEN`
 3. `$GH_TOKEN`
 4. `gh auth token` (gh CLI)
+
+`ghp inbox` always needs a token, and GitHub's notifications API accepts only a `gh` CLI token or a classic personal access token with the `notifications` or `repo` scope. Fine-grained personal access tokens are rejected.
 
 ## Test
 

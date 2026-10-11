@@ -9,6 +9,9 @@ Usage:
     ghp --json                        # machine-readable output
     ghp --me @clod                    # highlight mentions
     ghp --repo owner/name             # explicit repo (else auto-detect)
+    ghp inbox                         # unread notifications, all repositories
+    ghp inbox 1d                      # read and unread notifications since 1 day ago
+    ghp inbox --repo owner/name       # unread notifications for one repository
 """
 
 import argparse
@@ -28,6 +31,21 @@ from importlib.metadata import PackageNotFoundError, version
 ISO_8601_UTC = "%Y-%m-%dT%H:%M:%SZ"
 GITHUB_HANDLE_CHARS = "A-Za-z0-9-"
 LEGACY_CHECKPOINT_FILENAME = ".ghp-last-update-timestamp"
+TARGETS = ("upstream", "inbox")
+NOTIFICATIONS_MAX_PER_PAGE = 50
+NOTIFICATION_KINDS = {
+    "Issue": "issue",
+    "PullRequest": "pr",
+    "Commit": "commit",
+    "Release": "release",
+    "Discussion": "discussion",
+    "CheckSuite": "ci",
+}
+NOTIFICATION_URL_SEGMENTS = {
+    "Issue": "issues",
+    "PullRequest": "pull",
+    "Commit": "commit",
+}
 
 
 class ApiError(RuntimeError):
@@ -428,6 +446,137 @@ def _fetch_activity(repo, token, limit, cutoff):
     )
 
 
+def _fetch_notifications(repo, token, limit, cutoff):
+    """Fetch unread notifications, or read and unread ones since the cutoff."""
+    path = f"repos/{repo}/notifications" if repo else "notifications"
+    params = {"all": "true", "since": cutoff} if cutoff else {}
+    per_page = min(limit, NOTIFICATIONS_MAX_PER_PAGE)
+    notifications = []
+    page = 1
+
+    while len(notifications) < limit:
+        batch = _api(path, token, {**params, "per_page": per_page, "page": page})
+        if not isinstance(batch, list):
+            raise ApiError("Unexpected notifications payload from GitHub API")
+
+        notifications.extend(batch[: limit - len(notifications)])
+
+        if len(batch) < per_page:
+            break
+        page += 1
+
+    return notifications
+
+
+def _notification_subject_id(notification):
+    subject = notification["subject"]
+    if subject["type"] not in NOTIFICATION_URL_SEGMENTS:
+        return None
+    return (subject.get("url") or "").rstrip("/").split("/")[-1] or None
+
+
+def _notification_kind(notification):
+    subject_type = notification["subject"]["type"]
+    return NOTIFICATION_KINDS.get(subject_type, subject_type.lower())
+
+
+def _notification_url(notification):
+    base = notification["repository"]["html_url"]
+    subject_id = _notification_subject_id(notification)
+    if not subject_id:
+        return base
+    segment = NOTIFICATION_URL_SEGMENTS[notification["subject"]["type"]]
+    return f"{base}/{segment}/{subject_id}"
+
+
+def _fmt_notification(notification):
+    subject_id = _notification_subject_id(notification)
+    parts = []
+    if subject_id:
+        is_commit = notification["subject"]["type"] == "Commit"
+        parts.append(subject_id[:7] if is_commit else f"#{subject_id}")
+    reason = notification["reason"]
+    parts += [
+        _notification_kind(notification),
+        reason if notification["unread"] else f"{reason},read",
+        notification["updated_at"],
+        notification["subject"]["title"],
+    ]
+    return " ".join(parts)
+
+
+def _notifications_json(notifications):
+    return [
+        {
+            "id": notification["id"],
+            "repo": notification["repository"]["full_name"],
+            "type": _notification_kind(notification),
+            "number": _notification_subject_id(notification),
+            "title": notification["subject"]["title"],
+            "reason": notification["reason"],
+            "unread": notification["unread"],
+            "updated_at": notification["updated_at"],
+            "url": _notification_url(notification),
+        }
+        for notification in notifications
+    ]
+
+
+def _inbox(repo, raw_since, limit, json_output, now):
+    cutoff = None
+    try:
+        cutoff = _resolve_since(raw_since) if raw_since else None
+    except ValueError as exc:
+        _emit_error(str(exc), json_output, repo, now, cutoff)
+        return 1
+
+    token = _get_token()
+    if not token:
+        _emit_error(
+            "inbox needs a GitHub token; see the Auth section of the README",
+            json_output,
+            repo,
+            now,
+            cutoff,
+        )
+        return 1
+
+    try:
+        notifications = _fetch_notifications(repo, token, limit, cutoff)
+    except ApiError as exc:
+        _emit_error(str(exc), json_output, repo, now, cutoff)
+        return 1
+
+    if json_output:
+        out = {
+            "repo": repo,
+            "timestamp": now,
+            "since": cutoff,
+            "notifications": _notifications_json(notifications),
+        }
+        print(json.dumps(out, separators=(",", ":")))
+        return 0
+
+    head = f"inbox {now}"
+    if repo:
+        head = f"{head} repo={repo}"
+    if cutoff:
+        head = f"{head} since={cutoff}"
+    print(head)
+
+    by_repo = {}
+    for notification in notifications:
+        by_repo.setdefault(notification["repository"]["full_name"], []).append(
+            notification
+        )
+    for name, items in by_repo.items():
+        _print_section(name, items, _fmt_notification)
+
+    if not notifications:
+        print("none")
+    return 0
+
+
 def _mention_pattern(handle):
     normalized = handle.lstrip("@").strip()
     if not normalized:
@@ -671,14 +820,14 @@ def main():
     parser.add_argument(
         "target_or_since",
         nargs="?",
-        metavar="upstream|TIME",
-        help="Use the upstream remote, or show deltas since TIME",
+        metavar="upstream|inbox|TIME",
+        help="Use the upstream remote, show notifications, or show deltas since TIME",
     )
     parser.add_argument(
         "since_pos",
         nargs="?",
         metavar="TIME",
-        help="Show upstream deltas since TIME",
+        help="Show upstream deltas or inbox notifications since TIME",
     )
     parser.add_argument(
         "--since",
@@ -702,16 +851,16 @@ def main():
     )
     args = parser.parse_args()
 
-    remote = "origin"
-    if args.target_or_since == "upstream":
-        remote = "upstream"
+    target = args.target_or_since if args.target_or_since in TARGETS else None
+    remote = "upstream" if target == "upstream" else "origin"
+    if target:
         raw_since = args.since or args.since_pos
         if args.since and args.since_pos:
             parser.error("use TIME or --since, not both")
     else:
         raw_since = args.since or args.target_or_since
         if args.since_pos:
-            parser.error("only upstream may precede a positional TIME")
+            parser.error("only upstream or inbox may precede a positional TIME")
         if args.since and args.target_or_since:
             parser.error("use TIME or --since, not both")
 
@@ -719,12 +868,15 @@ def main():
         parser.error("use upstream or --repo, not both")
 
     now = _format_utc(_utc_now())
-    repo = args.repo or _detect_repo(remote)
+    repo = args.repo if target == "inbox" else args.repo or _detect_repo(remote)
     cutoff = None
 
     if args.limit < 1:
         _emit_error("--limit must be >= 1", args.json, repo, now, cutoff)
         return 1
+
+    if target == "inbox":
+        return _inbox(repo, raw_since, args.limit, args.json, now)
 
     if not repo:
         if remote == "upstream":

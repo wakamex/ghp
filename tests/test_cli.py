@@ -552,5 +552,198 @@ abcdef1 @dave 2026-03-07T17:30:00Z tighten output
         self.assertIsNone(fetch.call_args_list[1].args[3])
 
 
+def _notification(number, subject_type="Issue", unread=True, repo="owner/repo"):
+    path = {"Issue": "issues", "PullRequest": "pulls", "Commit": "commits"}.get(
+        subject_type
+    )
+    return {
+        "id": str(number),
+        "unread": unread,
+        "reason": "mention",
+        "updated_at": "2026-03-07T17:30:00Z",
+        "subject": {
+            "title": f"subject {number}",
+            "type": subject_type,
+            "url": (
+                f"https://api.github.com/repos/{repo}/{path}/{number}" if path else None
+            ),
+        },
+        "repository": {
+            "full_name": repo,
+            "html_url": f"https://github.com/{repo}",
+        },
+    }
+
+
+class NotificationTests(unittest.TestCase):
+    def test_fetch_notifications_requests_unread_for_the_account(self):
+        with mock.patch("ghp.cli._api", return_value=[]) as api:
+            cli._fetch_notifications(None, "token", 30, None)
+
+        api.assert_called_once_with(
+            "notifications", "token", {"per_page": 30, "page": 1}
+        )
+
+    def test_fetch_notifications_includes_read_ones_since_cutoff_for_a_repo(self):
+        with mock.patch("ghp.cli._api", return_value=[]) as api:
+            cli._fetch_notifications("owner/repo", "token", 5, "2026-03-07T17:00:00Z")
+
+        api.assert_called_once_with(
+            "repos/owner/repo/notifications",
+            "token",
+            {"all": "true", "since": "2026-03-07T17:00:00Z", "per_page": 5, "page": 1},
+        )
+
+    def test_fetch_notifications_paginates_at_the_api_page_maximum(self):
+        pages = [
+            [_notification(number) for number in range(50)],
+            [_notification(number) for number in range(50, 100)],
+        ]
+
+        with mock.patch("ghp.cli._api", side_effect=pages) as api:
+            notifications = cli._fetch_notifications(None, "token", 60, None)
+
+        self.assertEqual(60, len(notifications))
+        self.assertEqual(
+            [50, 50], [call.args[2]["per_page"] for call in api.call_args_list]
+        )
+
+    def test_notification_lines_identify_the_subject(self):
+        self.assertEqual(
+            "#7 pr mention 2026-03-07T17:30:00Z subject 7",
+            cli._fmt_notification(_notification(7, "PullRequest")),
+        )
+        self.assertEqual(
+            "#8 issue mention,read 2026-03-07T17:30:00Z subject 8",
+            cli._fmt_notification(_notification(8, unread=False)),
+        )
+        self.assertEqual(
+            "abcdef0 commit mention 2026-03-07T17:30:00Z subject abcdef0123",
+            cli._fmt_notification(_notification("abcdef0123", "Commit")),
+        )
+        self.assertEqual(
+            "discussion mention 2026-03-07T17:30:00Z subject 9",
+            cli._fmt_notification(_notification(9, "Discussion")),
+        )
+
+    def test_notification_urls_point_at_the_website(self):
+        self.assertEqual(
+            "https://github.com/owner/repo/pull/7",
+            cli._notification_url(_notification(7, "PullRequest")),
+        )
+        self.assertEqual(
+            "https://github.com/owner/repo",
+            cli._notification_url(_notification(9, "Discussion")),
+        )
+
+
+class InboxTests(unittest.TestCase):
+    def _run(self, argv, notifications=(), token="token"):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", ["ghp", *argv]))
+            stack.enter_context(mock.patch("ghp.cli._get_token", return_value=token))
+            stack.enter_context(
+                mock.patch(
+                    "ghp.cli._utc_now",
+                    return_value=cli._parse_iso8601("2026-03-07T18:00:00Z"),
+                )
+            )
+            self.detect_repo = stack.enter_context(mock.patch("ghp.cli._detect_repo"))
+            self.save_checkpoint = stack.enter_context(
+                mock.patch("ghp.cli._save_checkpoint")
+            )
+            fetch = stack.enter_context(
+                mock.patch(
+                    "ghp.cli._fetch_notifications", return_value=list(notifications)
+                )
+            )
+            stack.enter_context(redirect_stdout(stdout))
+            stack.enter_context(mock.patch("sys.stderr", stderr))
+            code = cli.main()
+        return code, stdout.getvalue(), stderr.getvalue(), fetch
+
+    def test_inbox_groups_notifications_by_repository(self):
+        code, output, _stderr, fetch = self._run(
+            ["inbox"],
+            [
+                _notification(1),
+                _notification(2, "PullRequest", repo="other/project"),
+                _notification(3),
+            ],
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            [
+                "inbox 2026-03-07T18:00:00Z",
+                "owner/repo 2",
+                "#1 issue mention 2026-03-07T17:30:00Z subject 1",
+                "#3 issue mention 2026-03-07T17:30:00Z subject 3",
+                "other/project 1",
+                "#2 pr mention 2026-03-07T17:30:00Z subject 2",
+            ],
+            output.splitlines(),
+        )
+        fetch.assert_called_once_with(None, "token", 30, None)
+
+    def test_inbox_ignores_the_checkout_and_checkpoints(self):
+        code, output, _stderr, _fetch = self._run(["inbox"])
+
+        self.assertEqual(0, code)
+        self.assertEqual(["inbox 2026-03-07T18:00:00Z", "none"], output.splitlines())
+        self.detect_repo.assert_not_called()
+        self.save_checkpoint.assert_not_called()
+
+    def test_inbox_accepts_since_and_repo(self):
+        code, output, _stderr, fetch = self._run(
+            ["inbox", "1h", "--repo", "owner/repo"]
+        )
+
+        self.assertEqual(0, code)
+        self.assertTrue(
+            output.startswith(
+                "inbox 2026-03-07T18:00:00Z repo=owner/repo since=2026-03-07T17:00:00Z"
+            )
+        )
+        fetch.assert_called_once_with("owner/repo", "token", 30, "2026-03-07T17:00:00Z")
+
+    def test_inbox_emits_json(self):
+        code, output, _stderr, _fetch = self._run(
+            ["inbox", "--json"], [_notification(7, "PullRequest", unread=False)]
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            {
+                "repo": None,
+                "timestamp": "2026-03-07T18:00:00Z",
+                "since": None,
+                "notifications": [
+                    {
+                        "id": "7",
+                        "repo": "owner/repo",
+                        "type": "pr",
+                        "number": "7",
+                        "title": "subject 7",
+                        "reason": "mention",
+                        "unread": False,
+                        "updated_at": "2026-03-07T17:30:00Z",
+                        "url": "https://github.com/owner/repo/pull/7",
+                    }
+                ],
+            },
+            json.loads(output),
+        )
+
+    def test_inbox_requires_a_token(self):
+        code, _output, stderr, fetch = self._run(["inbox"], token=None)
+
+        self.assertEqual(1, code)
+        self.assertIn("inbox needs a GitHub token", stderr)
+        fetch.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
