@@ -59,9 +59,37 @@ ghp owned                             # PRs awaiting workflow approval, unwatche
 - `owned` checks every account you own: your user account and each organization where you are an admin. It ignores the current checkout and keeps no checkpoint.
 - `owned` lists open pull requests whose [GitHub Actions](https://docs.github.com/actions) runs wait for maintainer approval, oldest first. GitHub holds runs from first-time and fork contributors this way, and sends no reminder while they wait. A pull request matches when its head commit has a run in the `action_required` state.
 - `owned` also lists non-fork, non-archived repositories you own but do not watch. GitHub sends no notifications for those, so their new issues and pull requests never reach `ghp inbox`.
+- `owned` prints an `awaiting-approval` section, with one `owner/repo#N @author created_at title` line per pull request, and an `unwatched` section with one `owner/repo` line per repository. It prints `none` when both are empty, and lists every match regardless of `--limit`.
 - API or auth failures exit non-zero instead of silently pretending there was no activity.
 - `--json` prints a machine-readable payload; on failure it emits a JSON object with an `error` field
   and exits non-zero.
+
+## JSON output
+
+`ghp inbox --json` prints `repo` (the `--repo` filter, or `null`), `timestamp`, `since` (the TIME cutoff, or `null`), and a `notifications` list. Each notification has:
+
+| Field | Meaning |
+|---|---|
+| `id` | GitHub's notification thread ID |
+| `repo` | `owner/repo` the notification belongs to |
+| `type` | `issue`, `pr`, `commit`, `release`, `discussion`, `ci`, or GitHub's subject type in lowercase |
+| `number` | issue or pull request number, or commit hash, as a string; `null` for other types |
+| `title` | subject title |
+| `reason` | why GitHub sent it, such as `mention`, `review_requested`, or `author` |
+| `unread` | `true` while the notification is unread |
+| `updated_at` | last update time, ISO 8601 UTC |
+| `url` | website link to the issue, pull request, or commit; the repository page for other types |
+
+`ghp owned --json` prints `timestamp`, `owners` (your login, then the organizations you administer), an `awaiting_approval` list, and `unwatched`, a list of `owner/repo` names. Each pull request in `awaiting_approval` has:
+
+| Field | Meaning |
+|---|---|
+| `repo` | `owner/repo` the pull request targets |
+| `number` | pull request number |
+| `title` | pull request title |
+| `user` | author login |
+| `created_at` | when the pull request was opened, ISO 8601 UTC |
+| `url` | website link to the pull request |
 
 ## Auth
 
