@@ -12,6 +12,7 @@ Usage:
     ghp inbox                         # unread notifications, all repositories
     ghp inbox 1d                      # read and unread notifications since 1 day ago
     ghp inbox --repo owner/name       # unread notifications for one repository
+    ghp owned                         # PRs awaiting workflow approval, unwatched repos
 """
 
 import argparse
@@ -31,7 +32,9 @@ from importlib.metadata import PackageNotFoundError, version
 ISO_8601_UTC = "%Y-%m-%dT%H:%M:%SZ"
 GITHUB_HANDLE_CHARS = "A-Za-z0-9-"
 LEGACY_CHECKPOINT_FILENAME = ".ghp-last-update-timestamp"
-TARGETS = ("upstream", "inbox")
+TARGETS = ("upstream", "inbox", "owned")
+API_MAX_PER_PAGE = 100
+OWNED_WORKERS = 8
 NOTIFICATIONS_MAX_PER_PAGE = 50
 NOTIFICATION_KINDS = {
     "Issue": "issue",
@@ -146,6 +149,23 @@ def _api(path, token, params=None):
         raise ApiError(f"API error: {exc.code} {exc.reason} for {url}{suffix}") from exc
     except urllib.error.URLError as exc:
         raise ApiError(f"API error: {exc.reason} for {url}") from exc
+
+
+def _api_all(path, token, params=None, key=None):
+    """GET every page of a list endpoint, optionally unwrapping the list at key."""
+    items = []
+    page = 1
+    while True:
+        payload = _api(
+            path, token, {**(params or {}), "per_page": API_MAX_PER_PAGE, "page": page}
+        )
+        batch = payload.get(key) if key and isinstance(payload, dict) else payload
+        if not isinstance(batch, list):
+            raise ApiError(f"Unexpected payload from GitHub API for {path}")
+        items.extend(batch)
+        if len(batch) < API_MAX_PER_PAGE:
+            return items
+        page += 1
 
 
 def _resolve_since(raw):
@@ -577,6 +597,161 @@ def _inbox(repo, raw_since, limit, json_output, now):
     return 0
 
 
+def _parallel_map(fn, items):
+    with ThreadPoolExecutor(max_workers=OWNED_WORKERS) as executor:
+        return list(executor.map(fn, items))
+
+
+def _fetch_owners(token):
+    """The authenticated user and the organizations they administer."""
+    login = _api("user", token)["login"]
+    memberships = _api_all("user/memberships/orgs", token, {"state": "active"})
+    orgs = sorted(
+        membership["organization"]["login"]
+        for membership in memberships
+        if membership["role"] == "admin"
+    )
+    return login, orgs
+
+
+def _fetch_owned_repos(login, orgs, token):
+    """Non-fork, non-archived repositories under the user and their orgs."""
+    sources = [("user/repos", {"affiliation": "owner"})] + [
+        (f"orgs/{org}/repos", {"type": "sources"}) for org in orgs
+    ]
+    batches = _parallel_map(
+        lambda source: _api_all(source[0], token, source[1]), sources
+    )
+    return sorted(
+        repo["full_name"]
+        for batch in batches
+        for repo in batch
+        if not repo["fork"] and not repo["archived"]
+    )
+
+
+def _fetch_watched_repos(token):
+    return {
+        repo["full_name"].casefold() for repo in _api_all("user/subscriptions", token)
+    }
+
+
+def _search_repo(item):
+    return "/".join(item["repository_url"].split("/")[-2:])
+
+
+def _fetch_open_prs(login, orgs, token):
+    queries = [f"user:{login}"] + [f"org:{org}" for org in orgs]
+    batches = _parallel_map(
+        lambda qualifier: _api_all(
+            "search/issues",
+            token,
+            {"q": f"is:pr is:open archived:false {qualifier}"},
+            "items",
+        ),
+        queries,
+    )
+    return [pr for batch in batches for pr in batch]
+
+
+def _awaiting_approval(prs, token):
+    """Open PRs whose head commit has workflow runs waiting for maintainer approval.
+
+    Runs from fork PRs list no pull_requests, so PRs match on their head commit.
+    """
+    repos = sorted({_search_repo(pr) for pr in prs})
+    waiting_runs = _parallel_map(
+        lambda repo: _api_all(
+            f"repos/{repo}/actions/runs",
+            token,
+            {"status": "action_required"},
+            "workflow_runs",
+        ),
+        repos,
+    )
+    waiting = {
+        repo: {run["head_sha"] for run in runs}
+        for repo, runs in zip(repos, waiting_runs)
+    }
+    candidates = [pr for pr in prs if waiting[_search_repo(pr)]]
+    heads = _parallel_map(
+        lambda pr: _api(f"repos/{_search_repo(pr)}/pulls/{pr['number']}", token)[
+            "head"
+        ]["sha"],
+        candidates,
+    )
+    found = [
+        pr for pr, head in zip(candidates, heads) if head in waiting[_search_repo(pr)]
+    ]
+    return sorted(found, key=lambda pr: pr["created_at"])
+
+
+def _fetch_owned_status(token):
+    login, orgs = _fetch_owners(token)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        owned = executor.submit(_fetch_owned_repos, login, orgs, token)
+        watched = executor.submit(_fetch_watched_repos, token)
+        prs = executor.submit(_fetch_open_prs, login, orgs, token)
+        unwatched = [
+            repo for repo in owned.result() if repo.casefold() not in watched.result()
+        ]
+        awaiting = _awaiting_approval(prs.result(), token)
+    return [login, *orgs], awaiting, unwatched
+
+
+def _fmt_awaiting(pr):
+    return (
+        f"{_search_repo(pr)}#{pr['number']} @{pr['user']['login']} "
+        f"{pr['created_at']} {pr['title']}"
+    )
+
+
+def _owned(json_output, now):
+    token = _get_token()
+    if not token:
+        _emit_error(
+            "owned needs a GitHub token; see the Auth section of the README",
+            json_output,
+            None,
+            now,
+            None,
+        )
+        return 1
+
+    try:
+        owners, awaiting, unwatched = _fetch_owned_status(token)
+    except ApiError as exc:
+        _emit_error(str(exc), json_output, None, now, None)
+        return 1
+
+    if json_output:
+        out = {
+            "timestamp": now,
+            "owners": owners,
+            "awaiting_approval": [
+                {
+                    "repo": _search_repo(pr),
+                    "number": pr["number"],
+                    "title": pr["title"],
+                    "user": pr["user"]["login"],
+                    "created_at": pr["created_at"],
+                    "url": pr["html_url"],
+                }
+                for pr in awaiting
+            ],
+            "unwatched": unwatched,
+        }
+        print(json.dumps(out, separators=(",", ":")))
+        return 0
+
+    print(f"owned {now} owners={','.join(owners)}")
+    _print_section("awaiting-approval", awaiting, _fmt_awaiting)
+    _print_section("unwatched", unwatched, str)
+    if not awaiting and not unwatched:
+        print("none")
+    return 0
+
+
 def _mention_pattern(handle):
     normalized = handle.lstrip("@").strip()
     if not normalized:
@@ -820,8 +995,11 @@ def main():
     parser.add_argument(
         "target_or_since",
         nargs="?",
-        metavar="upstream|inbox|TIME",
-        help="Use the upstream remote, show notifications, or show deltas since TIME",
+        metavar="upstream|inbox|owned|TIME",
+        help=(
+            "Use the upstream remote, show notifications, check owned repositories, "
+            "or show deltas since TIME"
+        ),
     )
     parser.add_argument(
         "since_pos",
@@ -866,8 +1044,13 @@ def main():
 
     if remote == "upstream" and args.repo:
         parser.error("use upstream or --repo, not both")
+    if target == "owned" and (raw_since or args.repo):
+        parser.error("owned takes no TIME or --repo")
 
     now = _format_utc(_utc_now())
+    if target == "owned":
+        return _owned(args.json, now)
+
     repo = args.repo if target == "inbox" else args.repo or _detect_repo(remote)
     cutoff = None
 

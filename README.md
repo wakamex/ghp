@@ -31,6 +31,7 @@ ghp --repo owner/name                 # explicit repo
 ghp inbox                             # unread notifications across all repositories
 ghp inbox 1d                          # read and unread notifications since 1 day ago
 ghp inbox --repo owner/name           # unread notifications for one repository
+ghp owned                             # PRs awaiting workflow approval, unwatched repositories
 ```
 
 ## Behavior
@@ -55,6 +56,9 @@ ghp inbox --repo owner/name           # unread notifications for one repository
 - `inbox` lists the authenticated account's notifications, grouped by repository and newest first. It ignores the current checkout and reads and writes no checkpoint: GitHub's unread state is the cursor, and ghp never marks a notification as read.
 - `inbox` alone returns unread notifications. With a TIME it returns read and unread notifications updated since then, and marks the read ones `read`.
 - Each inbox line gives the issue or pull request number (or short commit hash), the subject type, the reason GitHub sent it (such as `mention`, `review_requested`, or `author`), the update time, and the title.
+- `owned` checks every account you own: your user account and each organization where you are an admin. It ignores the current checkout and keeps no checkpoint.
+- `owned` lists open pull requests whose [GitHub Actions](https://docs.github.com/actions) runs wait for maintainer approval, oldest first. GitHub holds runs from first-time and fork contributors this way, and sends no reminder while they wait. A pull request matches when its head commit has a run in the `action_required` state.
+- `owned` also lists non-fork, non-archived repositories you own but do not watch. GitHub sends no notifications for those, so their new issues and pull requests never reach `ghp inbox`.
 - API or auth failures exit non-zero instead of silently pretending there was no activity.
 - `--json` prints a machine-readable payload; on failure it emits a JSON object with an `error` field
   and exits non-zero.
@@ -67,6 +71,8 @@ Looks for tokens in this order:
 2. `$GITHUB_TOKEN`
 3. `$GH_TOKEN`
 4. `gh auth token` (gh CLI)
+
+`ghp owned` always needs a token.
 
 `ghp inbox` always needs a token, and GitHub's notifications API accepts only a `gh` CLI token or a classic personal access token with the `notifications` or `repo` scope. Fine-grained personal access tokens are rejected.
 

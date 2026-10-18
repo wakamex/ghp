@@ -747,3 +747,173 @@ class InboxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _search_pr(repo, number, created_at, user="contributor"):
+    return {
+        "number": number,
+        "title": f"pr {number}",
+        "user": {"login": user},
+        "created_at": created_at,
+        "html_url": f"https://github.com/{repo}/pull/{number}",
+        "repository_url": f"https://api.github.com/repos/{repo}",
+    }
+
+
+def _repo(full_name, fork=False, archived=False):
+    return {"full_name": full_name, "fork": fork, "archived": archived}
+
+
+class OwnedTests(unittest.TestCase):
+    """Routes each GitHub API path to a canned response and rejects any other path."""
+
+    def setUp(self):
+        self.responses = {
+            ("user", ()): {"login": "me"},
+            ("user/memberships/orgs", (("state", "active"),)): [
+                {"organization": {"login": "team"}, "role": "admin"},
+                {"organization": {"login": "club"}, "role": "member"},
+            ],
+            ("user/repos", (("affiliation", "owner"),)): [
+                _repo("me/watched"),
+                _repo("me/Quiet"),
+                _repo("me/fork", fork=True),
+                _repo("me/old", archived=True),
+            ],
+            ("orgs/team/repos", (("type", "sources"),)): [_repo("team/tool")],
+            ("user/subscriptions", ()): [
+                {"full_name": "me/watched"},
+                {"full_name": "other/project"},
+            ],
+            (
+                "search/issues",
+                (("q", "is:pr is:open archived:false user:me"),),
+            ): {
+                "items": [
+                    _search_pr("me/watched", 5, "2026-03-07T12:00:00Z"),
+                    _search_pr("me/watched", 4, "2026-03-06T12:00:00Z"),
+                    _search_pr("me/Quiet", 9, "2026-03-05T12:00:00Z"),
+                ]
+            },
+            (
+                "search/issues",
+                (("q", "is:pr is:open archived:false org:team"),),
+            ): {"items": [_search_pr("team/tool", 2, "2026-03-01T12:00:00Z", "me")]},
+            ("repos/me/watched/actions/runs", (("status", "action_required"),)): {
+                "workflow_runs": [{"head_sha": "fork-head", "pull_requests": []}]
+            },
+            ("repos/me/Quiet/actions/runs", (("status", "action_required"),)): {
+                "workflow_runs": []
+            },
+            ("repos/team/tool/actions/runs", (("status", "action_required"),)): {
+                "workflow_runs": []
+            },
+            ("repos/me/watched/pulls/5", ()): {"head": {"sha": "fork-head"}},
+            ("repos/me/watched/pulls/4", ()): {"head": {"sha": "approved-head"}},
+        }
+        self.calls = []
+
+    def _api(self, path, token, params=None):
+        params = dict(params or {})
+        page = params.pop("page", 1)
+        params.pop("per_page", None)
+        key = (path, tuple(sorted(params.items())))
+        self.calls.append(key)
+        if key not in self.responses:
+            raise AssertionError(f"unexpected API call: {key}")
+        return self.responses[key] if page == 1 else []
+
+    def _run(self, argv):
+        stdout = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", ["ghp", *argv]))
+            stack.enter_context(mock.patch("ghp.cli._get_token", return_value="token"))
+            stack.enter_context(mock.patch("ghp.cli._api", side_effect=self._api))
+            stack.enter_context(
+                mock.patch(
+                    "ghp.cli._utc_now",
+                    return_value=cli._parse_iso8601("2026-03-07T18:00:00Z"),
+                )
+            )
+            self.detect_repo = stack.enter_context(mock.patch("ghp.cli._detect_repo"))
+            stack.enter_context(redirect_stdout(stdout))
+            code = cli.main()
+        return code, stdout.getvalue()
+
+    def test_owned_lists_waiting_fork_prs_and_unwatched_repositories(self):
+        code, output = self._run(["owned"])
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            [
+                "owned 2026-03-07T18:00:00Z owners=me,team",
+                "awaiting-approval 1",
+                "me/watched#5 @contributor 2026-03-07T12:00:00Z pr 5",
+                "unwatched 2",
+                "me/Quiet",
+                "team/tool",
+            ],
+            output.splitlines(),
+        )
+        self.detect_repo.assert_not_called()
+
+    def test_owned_fetches_pr_heads_only_in_repositories_with_waiting_runs(self):
+        self._run(["owned"])
+
+        pulls = sorted(path for path, _params in self.calls if "/pulls/" in path)
+        self.assertEqual(
+            ["repos/me/watched/pulls/4", "repos/me/watched/pulls/5"], pulls
+        )
+
+    def test_owned_emits_json(self):
+        code, output = self._run(["owned", "--json"])
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            {
+                "timestamp": "2026-03-07T18:00:00Z",
+                "owners": ["me", "team"],
+                "awaiting_approval": [
+                    {
+                        "repo": "me/watched",
+                        "number": 5,
+                        "title": "pr 5",
+                        "user": "contributor",
+                        "created_at": "2026-03-07T12:00:00Z",
+                        "url": "https://github.com/me/watched/pull/5",
+                    }
+                ],
+                "unwatched": ["me/Quiet", "team/tool"],
+            },
+            json.loads(output),
+        )
+
+    def test_owned_sorts_waiting_prs_oldest_first(self):
+        self.responses[("repos/me/watched/pulls/4", ())] = {
+            "head": {"sha": "fork-head"}
+        }
+
+        _code, output = self._run(["owned"])
+
+        self.assertEqual(
+            ["me/watched#4", "me/watched#5"],
+            [line.split()[0] for line in output.splitlines()[2:4]],
+        )
+
+    def test_api_all_reads_every_page(self):
+        pages = [{"items": [{"n": n} for n in range(100)]}, {"items": [{"n": 100}]}]
+
+        with mock.patch("ghp.cli._api", side_effect=pages) as api:
+            items = cli._api_all("search/issues", "token", {"q": "x"}, "items")
+
+        self.assertEqual(101, len(items))
+        self.assertEqual([1, 2], [call.args[2]["page"] for call in api.call_args_list])
+
+    def test_owned_rejects_time_and_repo(self):
+        for argv in (["owned", "1h"], ["owned", "--repo", "me/watched"]):
+            with (
+                self.subTest(argv=argv),
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                self._run(argv)
